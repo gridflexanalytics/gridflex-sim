@@ -316,8 +316,6 @@ export default function GridFlexSim() {
     { id: "contract",   label: "Contract Structure",  accent: "#34d399" },
     { id: "assumptions",label: "Assumptions",         accent: "#ef4444" },
   ];
-  const activeAccent = tabs.find((t) => t.id === tab)?.accent || "#3b82f6";
-
   function generateOnePager() {
     const client = utilityName.trim() || "Prospective Utility Client";
     const date = new Date().toLocaleDateString("en-US", { year: "numeric", month: "long", day: "numeric" });
