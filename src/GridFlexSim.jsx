@@ -5,27 +5,130 @@ import {
   ComposedChart, Area,
 } from "recharts";
 
+// ── Market types ──────────────────────────────────────────────────────────────
+
+const MARKET_TYPES = {
+  rto:  { key: "rto",  label: "RTO / ISO",            accent: "#2563eb" },
+  vi:   { key: "vi",   label: "Vertically Integrated", accent: "#7c3aed" },
+  emc:  { key: "emc",  label: "EMC / Cooperative",    accent: "#16a34a" },
+};
+
+// Which modules & tabs are relevant for each market. Modules not in the list
+// are hidden in the UI and their value contribution is zeroed in runModel.
+const MARKET_MODULES = {
+  rto: {
+    redispatch:  true,
+    curtailment: true,
+    capacity:    true,
+    cp_avoid:    false,
+    reserves:    true,
+    arbitrage:   true,
+    cap_defer:   true,
+    tabs: ["leverage", "formulas", "optimal", "incentive", "contract", "assumptions"],
+  },
+  vi: {
+    redispatch:  true,
+    curtailment: false,  // SE VI utilities have near-zero renewable curtailment
+    capacity:    false,
+    cp_avoid:    false,
+    reserves:    true,
+    arbitrage:   false,  // no organized market exposing hourly arb opportunity
+    cap_defer:   true,   // headline value for VI utilities
+    tabs: ["leverage", "formulas", "optimal", "incentive", "contract", "assumptions"],
+  },
+  emc: {
+    redispatch:  false,  // framed as CP avoidance, not redispatch
+    curtailment: false,
+    capacity:    false,
+    cp_avoid:    true,   // headline value for cooperatives
+    reserves:    false,  // G&T holds reserves, not the distribution coop
+    arbitrage:   true,   // wholesale purchase cost varies by hour
+    cap_defer:   true,
+    // No "leverage" tab for EMC — PTDF leverage is a transmission concept,
+    // not applicable at distribution. Value chain shown in formulas tab.
+    tabs: ["formulas", "optimal", "incentive", "contract", "assumptions"],
+  },
+};
+
+// Per-market default parameter values. Changing the market-type selector
+// re-seeds p with the corresponding preset so the sim opens in a sensible
+// configuration for that utility class without manual slider tuning.
+const MARKET_PRESETS = {
+  rto: {
+    // Redispatch-driven framing — typical PJM/MISO thermal-constraint case.
+    h_bind: 320, mw_redisp: 100, price_diff: 55,
+    mwh_curt: 45000, curt_attrib: 0.35, curt_mwh_value: 48,
+    // Topology leverage — PTDF-driven, transmission-grid concept
+    topology_leverage: 5,
+    // Capacity market (PJM BRA ~$200/MW-day, MISO PRA ~$80/MW-day; ~$180 avg reasonable)
+    capacity_price_mw_day: 180, capacity_accreditation: 0.60,
+    // CP avoidance — not applicable
+    cp_charge_kw_month: 0, trans_charge_kw_month: 0,
+    cp_events_per_year: 12, cp_coincidence: 0.0,
+    // Energy arbitrage — LMP spread between peak & off-peak
+    arb_spread_mwh: 40, arb_hours_per_year: 500,
+    // Reserves
+    reserve_eligible_pct: 0.80, reserve_rate_kw_yr: 8,
+    // Capital deferral — MW threshold = MW of redispatch the project would
+    // have absorbed. Realization scales with constraint relief.
+    capex: 28000000, wacc: 0.075, years_deferral: 3,
+    mw_deferral_threshold: 100,
+  },
+  vi: {
+    // Internal redispatch within a balancing authority — smaller MW of out-of-merit
+    h_bind: 250, mw_redisp: 60, price_diff: 35,
+    mwh_curt: 0, curt_attrib: 0.0, curt_mwh_value: 0,
+    topology_leverage: 4,
+    // No capacity market
+    capacity_price_mw_day: 0, capacity_accreditation: 0.0,
+    cp_charge_kw_month: 0, trans_charge_kw_month: 0,
+    cp_events_per_year: 12, cp_coincidence: 0.0,
+    // No hourly market to arb against
+    arb_spread_mwh: 0, arb_hours_per_year: 0,
+    // Reserves still valued via IRP reserve margin
+    reserve_eligible_pct: 0.80, reserve_rate_kw_yr: 6,
+    // Capital deferral — VI utilities have the largest projects
+    capex: 50000000, wacc: 0.075, years_deferral: 4,
+    mw_deferral_threshold: 60,
+  },
+  emc: {
+    // EMC does not "redispatch" — these values are leftovers for sim compat
+    h_bind: 50, mw_redisp: 0, price_diff: 0,
+    mwh_curt: 0, curt_attrib: 0.0, curt_mwh_value: 0,
+    // Topology leverage = 1: distribution coops are at the load end of the
+    // grid; no PTDF leverage applies. Value comes from CP coincidence, not
+    // network topology.
+    topology_leverage: 1,
+    capacity_price_mw_day: 0, capacity_accreditation: 0.0,
+    // CP avoidance — HEADLINE value stream for cooperatives.
+    // $5/kW-month G&T demand charge + $3/kW-month NITS ≈ $8/kW-month total CP impact.
+    cp_charge_kw_month: 5.0, trans_charge_kw_month: 3.0,
+    cp_events_per_year: 12, cp_coincidence: 0.80,
+    // Wholesale purchase arbitrage — peak vs off-peak wholesale $/MWh spread
+    arb_spread_mwh: 20, arb_hours_per_year: 400,
+    // No reserves at distribution coop level
+    reserve_eligible_pct: 0.0, reserve_rate_kw_yr: 0,
+    // Capital deferral (distribution substations / feeders)
+    capex: 12000000, wacc: 0.055, years_deferral: 3,
+    // For EMC, deferral threshold is the MW of CP-coincident peak load
+    // reduction needed to push out a distribution upgrade.
+    mw_deferral_threshold: 15,
+  },
+};
+
 // ── Defaults ──────────────────────────────────────────────────────────────────
 
 const DEFAULTS = {
-  // Module 2 — Base Case
-  h_bind: 320,
-  mw_redisp: 100,
-  price_diff: 55,
-  mwh_curt: 45000,
-  curt_attrib: 0.35,
-  curt_mwh_value: 48,
+  // Market-type + preset-driven value-stack fields (all markets seed these;
+  // some zero out depending on market)
+  ...MARKET_PRESETS.rto,
   // Module 3 — Topology Leverage
-  topology_leverage: 8,
+  topology_leverage: 5,
   // Module 4 — Intervention
   mw_flex: 10,
   delivery_factor: 0.70,
   coincidence_factor: 0.80,
   curt_mitigation: 0.45,
-  // Module 6 — Capital Deferral
-  capex: 28000000,
-  wacc: 0.07,
-  years_deferral: 3,
   // Module 7 — Building Incentive
   hvac_unit_cost: 45000,
   hvac_unit_kw: 15,
@@ -40,35 +143,107 @@ const DEFAULTS = {
   contract_years: 5,
   gridflex_rate_pct: 0.70,
   facility_incentive_kw_yr: 50,
+  // Capital deferral — MW threshold at which the avoided/deferred infrastructure
+  // project is considered "moved out" by N years. Realization scales linearly
+  // with deployment up to this threshold. Pulled from market preset.
+  mw_deferral_threshold: 100,
 };
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 function runModel(p) {
+  const mods = MARKET_MODULES[p.market || "rto"] || MARKET_MODULES.rto;
+
+  // ── Dependable MW + leverage (constraint relief framing) ────────────────
+  // mw_effective = MW available *during* binding hours.
+  // coincidence_factor = fraction of binding hours where flex is operational.
+  // (Direction matters: it's binding-hours-with-flex / binding-hours, not
+  // flex-hours-overlapping-binding / flex-hours.)
   const mw_effective = p.mw_flex * p.delivery_factor * p.coincidence_factor;
   const mw_redisp_equivalent = mw_effective * p.topology_leverage;
   const reduction_fraction = p.mw_redisp > 0
     ? Math.min(mw_redisp_equivalent / p.mw_redisp, 1.0)
     : 0;
   const leverageDenom = p.topology_leverage * p.delivery_factor * p.coincidence_factor;
-  const mw_to_fully_relieve = leverageDenom > 0
+  const mw_to_fully_relieve = leverageDenom > 0 && p.mw_redisp > 0
     ? p.mw_redisp / leverageDenom
     : 0;
 
+  // ── Production cost delta (redispatch + curtailment, RTO + VI only) ─────
   const e_redisp_base = p.mw_redisp * p.h_bind;
   const e_redisp_saved = e_redisp_base * reduction_fraction;
-  const redispatch_value = e_redisp_saved * p.price_diff;
+  const redispatch_value = mods.redispatch ? e_redisp_saved * p.price_diff : 0;
 
   const curtailment_attrib = p.mwh_curt * p.curt_attrib;
   const curtailment_recovered = curtailment_attrib * p.curt_mitigation * reduction_fraction;
-  const curtailment_value = curtailment_recovered * p.curt_mwh_value;
+  const curtailment_value = mods.curtailment ? curtailment_recovered * p.curt_mwh_value : 0;
 
   const production_cost_delta = redispatch_value + curtailment_value;
-  const capital_deferral_value =
-    p.capex * (1 - 1 / Math.pow(1 + p.wacc, p.years_deferral));
-  const total_value = production_cost_delta + capital_deferral_value;
+
+  // ── Reserves — derate by delivery factor. NERC ancillary products carry
+  // non-performance penalty, so revenue applies to dependable MW, not nameplate.
+  const reserve_value = mods.reserves
+    ? p.mw_flex * 1000 * (p.delivery_factor || 1)
+        * (p.reserve_eligible_pct || 0) * (p.reserve_rate_kw_yr || 0)
+    : 0;
+
+  // ── Capacity market — ELCC accreditation already encodes resource adequacy
+  // contribution; do not double-derate by delivery. Penalty exposure is a
+  // separate risk overlay (not in revenue model).
+  const capacity_market_value = mods.capacity
+    ? p.mw_flex * (p.capacity_price_mw_day || 0) * 365 * (p.capacity_accreditation || 0)
+    : 0;
+
+  // ── Coincident-peak avoidance (EMC) — derate by delivery factor. If the
+  // load fails to be online during the billed CP hour, no avoidance is
+  // realized for that month.
+  const cp_avoidance_value = mods.cp_avoid
+    ? p.mw_flex * 1000 * (p.delivery_factor || 1) * (p.cp_coincidence || 0)
+        * ((p.cp_charge_kw_month || 0) + (p.trans_charge_kw_month || 0))
+        * 12
+    : 0;
+
+  // ── Energy arbitrage — pre-cool off-peak, dispatch peak. arb_hours_per_year
+  // is already a curated subset of profitable hours, so don't double-derate
+  // by constraint coincidence_factor (that's a binding-hour overlap, not an
+  // arb-hour overlap). Apply delivery factor only.
+  const arbitrage_value = mods.arbitrage
+    ? p.mw_flex * (p.delivery_factor || 1) * (p.arb_spread_mwh || 0) * (p.arb_hours_per_year || 0)
+    : 0;
+
+  // ── Capital deferral — structural overlay, scaled by deployment realization.
+  // RTO/VI: realization = constraint relief fraction (the project gets
+  // deferred when the constraint that drove it is relieved).
+  // EMC: realization scales with CP-coincident MW vs. a deployment threshold
+  // (the load reduction needed to push out the distribution upgrade).
+  const cp_relief_mw = p.mw_flex * (p.delivery_factor || 1) * (p.cp_coincidence || 0);
+  const deferral_threshold = Math.max(p.mw_deferral_threshold || 1, 1);
+  const deferral_realized = mods.redispatch
+    ? reduction_fraction
+    : mods.cp_avoid
+      ? Math.min(1, cp_relief_mw / deferral_threshold)
+      : 0;
+  const capital_deferral_full = mods.cap_defer
+    ? p.capex * (1 - 1 / Math.pow(1 + p.wacc, p.years_deferral))
+    : 0;
+  const capital_deferral_value = capital_deferral_full * deferral_realized;
+
+  // ── Aggregations ─────────────────────────────────────────────────────────
+  const total_value =
+    production_cost_delta
+    + capital_deferral_value
+    + reserve_value
+    + capacity_market_value
+    + cp_avoidance_value
+    + arbitrage_value;
+
+  // addressable_annual = recurring annual revenue (excludes one-time capital
+  // deferral NPV). Used for $/kW-yr and contract pricing.
+  const addressable_annual =
+    production_cost_delta + reserve_value + capacity_market_value
+    + cp_avoidance_value + arbitrage_value;
   const dollars_per_kw_yr =
-    p.mw_flex > 0 ? production_cost_delta / (p.mw_flex * 1000) : 0;
+    p.mw_flex > 0 ? addressable_annual / (p.mw_flex * 1000) : 0;
 
   const mw_redisp_avoided = Math.min(mw_redisp_equivalent, p.mw_redisp);
   const leverage_ratio_realized = mw_effective > 0
@@ -87,7 +262,14 @@ function runModel(p) {
     curtailment_recovered,
     curtailment_value,
     production_cost_delta,
+    capital_deferral_full,
     capital_deferral_value,
+    deferral_realized,
+    reserve_value,
+    capacity_market_value,
+    cp_avoidance_value,
+    arbitrage_value,
+    addressable_annual,
     total_value,
     dollars_per_kw_yr,
     mw_redisp_avoided,
@@ -112,12 +294,17 @@ function computeSweep(p) {
       const prevMW = pts[i - 1];
       const prevR = runModel({ ...p, mw_flex: prevMW });
       const delta_kw = (mw - prevMW) * 1000;
-      const delta_val = r.production_cost_delta - prevR.production_cost_delta;
+      // Use full addressable revenue (production cost delta + capacity + CP
+      // avoidance + arbitrage + reserves) so the marginal calc works for any
+      // market type. Using only production_cost_delta would zero out for EMC
+      // and ignore capacity-market marginal value for RTO.
+      const delta_val = r.addressable_annual - prevR.addressable_annual;
       marginal_per_kw = delta_kw > 0 ? delta_val / delta_kw : 0;
     }
     return {
       mw,
       production_cost_delta: r.production_cost_delta,
+      addressable_annual: r.addressable_annual,
       total_value: r.total_value,
       dollars_per_kw_yr: r.dollars_per_kw_yr,
       marginal_per_kw: Math.max(0, marginal_per_kw),
@@ -127,16 +314,38 @@ function computeSweep(p) {
   });
 }
 
-function findOptimal(sweep, threshold_pct) {
+function findOptimal(sweep, threshold_pct, mwFlexInput) {
   if (!sweep.length) return null;
   const peakMarginal = sweep[0].marginal_per_kw;
+  const lastMarginal = sweep[sweep.length - 1].marginal_per_kw;
+
+  // Detect linear-value regime: marginal $/kW-yr stays roughly flat across
+  // the sweep. Happens for markets without a saturation mechanism (EMC: CP
+  // avoidance + arbitrage are linear in MW). In that case the threshold rule
+  // silently selects the sweep ceiling, which is misleading. Instead: anchor
+  // optimal to the user's current deployment input (deployment-economics
+  // limited, not value-limited).
+  const linearTol = 0.05;
+  const isLinear = peakMarginal > 0
+    && Math.abs(lastMarginal - peakMarginal) / peakMarginal < linearTol;
+  if (isLinear) {
+    const target = Math.max(1, Math.round(mwFlexInput || sweep[0].mw));
+    const matched = sweep.find((s) => s.mw === target) || sweep[Math.min(sweep.length - 1, target - 1)] || sweep[0];
+    return {
+      ...matched,
+      cutoff_value: peakMarginal,
+      peak_marginal: peakMarginal,
+      regime: "linear_value",
+    };
+  }
+
   const cutoff = peakMarginal * (threshold_pct / 100);
   let optimal = sweep[0];
   for (let i = 1; i < sweep.length; i++) {
     if (sweep[i].marginal_per_kw >= cutoff) optimal = sweep[i];
     else break;
   }
-  return { ...optimal, cutoff_value: cutoff, peak_marginal: peakMarginal };
+  return { ...optimal, cutoff_value: cutoff, peak_marginal: peakMarginal, regime: "saturating" };
 }
 
 // ── Leverage comparison ───────────────────────────────────────────────────────
@@ -168,7 +377,11 @@ function computeIncentiveData(p, sweep) {
     const itc = gross * p.itc_pct;
     const rebate = gross * p.utility_incentive_pct;
     const net = gross - itc - rebate;
-    const pool = s.production_cost_delta * 8;
+    // Use addressable revenue × term — works across all market types
+    // (RTO production cost delta + capacity, VI production cost delta,
+    // EMC CP avoidance + arbitrage). Production cost delta alone is $0
+    // for EMC, which would zero the value pool incorrectly.
+    const pool = s.addressable_annual * p.contract_years;
     return { mw: s.mw, units, gross, itc, rebate, net, pool };
   });
 }
@@ -258,14 +471,28 @@ const TAB = (active, accent) => ({
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 export default function GridFlexSim() {
-  const [p, setP] = useState(DEFAULTS);
+  const [market, setMarketRaw] = useState("rto");
+  const [p, setP] = useState({ ...DEFAULTS, market: "rto" });
   const [tab, setTab] = useState("leverage");
   const [utilityName, setUtilityName] = useState("");
   const set = (k) => (v) => setP((prev) => ({ ...prev, [k]: v }));
 
+  // Changing the market type re-seeds the market-specific parameters with
+  // that market's preset while preserving user-set fields that are market-
+  // independent (mw_flex, delivery_factor, contract_years, etc.). This lets
+  // the user toggle between pitches without losing their flex-load config.
+  const setMarket = (m) => {
+    setMarketRaw(m);
+    setP((prev) => ({ ...prev, ...MARKET_PRESETS[m], market: m }));
+    const allowedTabs = MARKET_MODULES[m].tabs;
+    if (!allowedTabs.includes(tab)) setTab(allowedTabs[0]);
+  };
+  const mods = MARKET_MODULES[market] || MARKET_MODULES.rto;
+  const marketMeta = MARKET_TYPES[market] || MARKET_TYPES.rto;
+
   const r = useMemo(() => runModel(p), [p]);
   const sweep = useMemo(() => computeSweep(p), [p]);
-  const optimal = useMemo(() => findOptimal(sweep, p.threshold_pct), [sweep, p.threshold_pct]);
+  const optimal = useMemo(() => findOptimal(sweep, p.threshold_pct, p.mw_flex), [sweep, p.threshold_pct, p.mw_flex]);
   const levComp = useMemo(() => buildLeverageComparison(p), [p]);
   const incentiveData = useMemo(() => computeIncentiveData(p, sweep), [p, sweep]);
 
@@ -326,6 +553,78 @@ export default function GridFlexSim() {
     const eRedisp = fmtD(p.mw_redisp * p.h_bind * p.price_diff);
     const eCurt = fmtD(p.mwh_curt * p.curt_attrib * p.curt_mwh_value);
     const eTotalDrag = fmtD(p.mw_redisp * p.h_bind * p.price_diff + p.mwh_curt * p.curt_attrib * p.curt_mwh_value);
+
+    const marketLabel = marketMeta.label;
+    const marketSubtitle = market === "rto" ? "Production Cost Delta & Capacity Value Analysis"
+                          : market === "vi"  ? "Production Cost Delta & Capital Deferral Analysis"
+                          : "Coincident-Peak Avoidance & Wholesale Cost Analysis";
+
+    // Exposure section varies by market type
+    const exposureSectionTitle = market === "emc"
+      ? "Coincident-Peak Exposure — What It's Costing You Today"
+      : "The Constraint — What It's Costing You Today";
+
+    const exposureCards = market === "emc" ? `
+      <div class="card blue">
+        <div class="card-label">G&amp;T Demand Charge</div>
+        <div class="card-value">$${p.cp_charge_kw_month.toFixed(2)}/kW-mo</div>
+        <div class="card-sub">billed on coincident peak</div>
+      </div>
+      <div class="card blue">
+        <div class="card-label">Transmission (NITS)</div>
+        <div class="card-value">$${p.trans_charge_kw_month.toFixed(2)}/kW-mo</div>
+        <div class="card-sub">billed on same CP determinant</div>
+      </div>
+      <div class="card blue">
+        <div class="card-label">Total CP Rate</div>
+        <div class="card-value">$${((p.cp_charge_kw_month + p.trans_charge_kw_month) * 12).toFixed(0)}/kW-yr</div>
+        <div class="card-sub">annualized cost of 1 kW on CP</div>
+      </div>
+    ` : `
+      <div class="card blue">
+        <div class="card-label">Binding Hours / Year</div>
+        <div class="card-value">${p.h_bind} hrs</div>
+        <div class="card-sub">hours at thermal limit</div>
+      </div>
+      <div class="card blue">
+        <div class="card-label">MW Redispatch Required</div>
+        <div class="card-value">${p.mw_redisp} MW</div>
+        <div class="card-sub">avg. out-of-merit dispatch</div>
+      </div>
+      <div class="card blue">
+        <div class="card-label">Price Differential</div>
+        <div class="card-value">$${p.price_diff}/MWh</div>
+        <div class="card-sub">expensive minus cheap unit</div>
+      </div>
+    `;
+
+    const exposureTable = market === "emc" ? `
+      <table>
+        <tr><th>Cost Component</th><th style="text-align:right;">Annual $/kW-yr</th></tr>
+        <tr><td class="td-label">G&amp;T demand charge on coincident peak</td><td class="td-value">$${(p.cp_charge_kw_month * 12).toFixed(0)}/kW-yr</td></tr>
+        <tr><td class="td-label">Transmission service (NITS) on coincident peak</td><td class="td-value">$${(p.trans_charge_kw_month * 12).toFixed(0)}/kW-yr</td></tr>
+        <tr style="background:#fef2f2;"><td class="td-label" style="font-weight:600;">Every 1 kW on CP costs the coop annually</td><td class="td-value" style="color:#dc2626;">$${((p.cp_charge_kw_month + p.trans_charge_kw_month) * 12).toFixed(0)}/kW-yr</td></tr>
+        <tr style="background:#f0fdf4;"><td class="td-label" style="font-weight:600;">GridFlex Addressable Value (at optimal ${optMW} MW)</td><td class="td-value" style="color:#16a34a;">${fmtD(r.cp_avoidance_value + r.arbitrage_value)}</td></tr>
+      </table>
+    ` : `
+      <table>
+        <tr><th>Cost Component</th><th style="text-align:right;">Annual Cost</th></tr>
+        <tr><td class="td-label">Redispatch (out-of-merit dispatch cost)</td><td class="td-value">${eRedisp}</td></tr>
+        ${mods.curtailment ? `<tr><td class="td-label">Attributable curtailment losses (${Math.round(p.curt_attrib * 100)}% attribution)</td><td class="td-value">${eCurt}</td></tr>` : ""}
+        <tr style="background:#fef2f2;"><td class="td-label" style="font-weight:600;">Total Annual Production Cost Drag (full system)</td><td class="td-value" style="color:#dc2626;">${eTotalDrag}</td></tr>
+        <tr style="background:#f0fdf4;"><td class="td-label" style="font-weight:600;">GridFlex Addressable Value (at optimal ${optMW} MW)</td><td class="td-value" style="color:#16a34a;">${fmtD(optimal ? optimal.production_cost_delta : r.production_cost_delta)}</td></tr>
+      </table>
+    `;
+
+    // Value-stack rows vary by market — only show streams actually active.
+    const valueStackRows = [
+      mods.redispatch ? `<tr><td class="td-label">Production cost delta (redispatch savings${mods.curtailment ? " + curtailment recovery" : ""})</td><td class="td-value">${fmtD(optimal ? optimal.production_cost_delta : r.production_cost_delta)}</td></tr>` : "",
+      mods.capacity   ? `<tr><td class="td-label">Capacity market revenue ($${p.capacity_price_mw_day}/MW-day × ${fmtPct(p.capacity_accreditation)} accreditation)</td><td class="td-value">${fmtD(r.capacity_market_value)}</td></tr>` : "",
+      mods.cp_avoid   ? `<tr><td class="td-label">Coincident-peak avoidance ($${(p.cp_charge_kw_month + p.trans_charge_kw_month).toFixed(2)}/kW-mo × ${fmtPct(p.cp_coincidence)} coincidence × 12 months)</td><td class="td-value">${fmtD(r.cp_avoidance_value)}</td></tr>` : "",
+      mods.arbitrage  ? `<tr><td class="td-label">Energy arbitrage ($${p.arb_spread_mwh}/MWh spread × ${p.arb_hours_per_year} hrs/yr)</td><td class="td-value">${fmtD(r.arbitrage_value)}</td></tr>` : "",
+      mods.reserves   ? `<tr><td class="td-label">Operating reserve credit (${fmtPct(p.reserve_eligible_pct)} eligible × $${p.reserve_rate_kw_yr}/kW-yr)</td><td class="td-value">${fmtD(r.reserve_value)}</td></tr>` : "",
+      mods.cap_defer  ? `<tr><td class="td-label">Capital deferral — NPV of ${p.years_deferral}-year delay on $${(p.capex / 1e6).toFixed(0)}M project (${Math.round(p.wacc * 100)}% WACC)</td><td class="td-value">${fmtD(r.capital_deferral_value)}</td></tr>` : "",
+    ].filter(Boolean).join("\n      ");
 
     const html = `<!DOCTYPE html>
 <html lang="en">
@@ -393,7 +692,7 @@ export default function GridFlexSim() {
   </div>
 
   <div class="title">Constraint Relief via Topology-Targeted Flex Load</div>
-  <div class="subtitle">Production Cost Delta Analysis &amp; Engagement Proposal</div>
+  <div class="subtitle">${marketLabel} &mdash; ${marketSubtitle}</div>
 
   <div class="highlight-box">
     <div class="hl-label">The Core Concept</div>
@@ -404,31 +703,12 @@ export default function GridFlexSim() {
   </div>
 
   <div class="section">
-    <div class="section-head">The Constraint — What It's Costing You Today</div>
+    <div class="section-head">${exposureSectionTitle}</div>
     <div class="grid3">
-      <div class="card blue">
-        <div class="card-label">Binding Hours / Year</div>
-        <div class="card-value">${p.h_bind} hrs</div>
-        <div class="card-sub">hours at thermal limit</div>
-      </div>
-      <div class="card blue">
-        <div class="card-label">MW Redispatch Required</div>
-        <div class="card-value">${p.mw_redisp} MW</div>
-        <div class="card-sub">avg. out-of-merit dispatch</div>
-      </div>
-      <div class="card blue">
-        <div class="card-label">Price Differential</div>
-        <div class="card-value">$${p.price_diff}/MWh</div>
-        <div class="card-sub">expensive minus cheap unit</div>
-      </div>
+      ${exposureCards}
     </div>
     <div style="margin-top:10px;">
-      <table>
-        <tr><th>Cost Component</th><th style="text-align:right;">Annual Cost</th></tr>
-        <tr><td class="td-label">Redispatch (out-of-merit dispatch cost)</td><td class="td-value">${eRedisp}</td></tr>
-        <tr><td class="td-label">Attributable curtailment losses (${Math.round(p.curt_attrib * 100)}% attribution)</td><td class="td-value">${eCurt}</td></tr>
-        <tr style="background:#fef2f2;"><td class="td-label" style="font-weight:600;">Total Annual Production Cost Drag</td><td class="td-value" style="color:#dc2626;">${eTotalDrag}</td></tr>
-      </table>
+      ${exposureTable}
     </div>
   </div>
 
@@ -481,11 +761,10 @@ export default function GridFlexSim() {
   </div>
 
   <div class="section">
-    <div class="section-head">Full Value Stack — At Optimal ${optMW} MW Deployment</div>
+    <div class="section-head">Full Value Stack — At Optimal ${optMW} MW Deployment (${marketLabel})</div>
     <table>
       <tr><th>Value Component</th><th style="text-align:right;">Annual Value</th></tr>
-      <tr><td class="td-label">Production cost delta (redispatch savings)</td><td class="td-value">${fmtD(optimal ? optimal.production_cost_delta : r.production_cost_delta)}</td></tr>
-      <tr><td class="td-label">Capital deferral — NPV of ${p.years_deferral}-year delay on $${(p.capex / 1e6).toFixed(0)}M project (${Math.round(p.wacc * 100)}% WACC)</td><td class="td-value">${fmtD(r.capital_deferral_value)}</td></tr>
+      ${valueStackRows}
       <tr style="background:#f0fdf4;"><td class="td-label" style="font-weight:600;">Total Value Stack</td><td class="td-value" style="color:#16a34a;">${optTotal}</td></tr>
     </table>
   </div>
@@ -493,9 +772,9 @@ export default function GridFlexSim() {
   <div class="poc-box">
     <div class="poc-label">Proof of Concept Proposal — ${pocMW} MW Pilot</div>
     <div class="poc-text">
-      GridFlex proposes a <strong>${pocMW} MW flex load pilot</strong> at the highest-leverage node in the constraint corridor.
-      At ${p.topology_leverage}x topology leverage, this delivers <strong>${(pocMW * p.delivery_factor * p.coincidence_factor * p.topology_leverage).toFixed(1)} MW of redispatch equivalent</strong> — enough to produce a measurable, auditable production cost delta of approximately <strong>${fmtD(pocR.production_cost_delta)} per year</strong>.
-      Results are validated against actual EMS dispatch logs and ISO/RTO public data. If the pilot validates, Phase 2 scales to the full ${optMW} MW optimal deployment.
+      ${market === "emc"
+        ? `GridFlex proposes a <strong>${pocMW} MW flex load pilot</strong> deployed at commercial sites with the highest coincident-peak coincidence. The fleet delivers <strong>${(pocMW * p.delivery_factor * p.cp_coincidence).toFixed(1)} MW of dependable load reduction during the cooperative's billed CP hour</strong>, producing measurable wholesale demand-charge avoidance of approximately <strong>${fmtD(pocR.cp_avoidance_value + pocR.arbitrage_value)} per year</strong>. Results are verified against BESS dispatch logs and EMC interval meter data. If the pilot validates, Phase 2 scales to the full ${optMW} MW optimal deployment.`
+        : `GridFlex proposes a <strong>${pocMW} MW flex load pilot</strong> at the highest-leverage node in the constraint corridor. At ${p.topology_leverage}x topology leverage, this delivers <strong>${(pocMW * p.delivery_factor * p.coincidence_factor * p.topology_leverage).toFixed(1)} MW of redispatch equivalent</strong> — enough to produce a measurable, auditable production cost delta of approximately <strong>${fmtD(pocR.production_cost_delta)} per year</strong>. Results are validated against actual EMS dispatch logs and ISO/RTO public data. If the pilot validates, Phase 2 scales to the full ${optMW} MW optimal deployment.`}
     </div>
   </div>
 
@@ -545,7 +824,7 @@ export default function GridFlexSim() {
     <div class="footer-left">
       <strong>Joshua Yackee</strong><br/>
       GridFlex Analytics<br/>
-      scgssolutions@gmail.com<br/>
+      jyackee@gridflexanalytics.com<br/>
       gridflexanalytics.com
     </div>
     <div class="footer-right">
@@ -565,10 +844,14 @@ export default function GridFlexSim() {
   }
 
   const barData = [
-    { name: "Redispatch",  value: r.redispatch_value,       color: "#3b82f6" },
-    { name: "Curtailment", value: r.curtailment_value,      color: "#8b5cf6" },
-    { name: "Cap Deferral",value: r.capital_deferral_value, color: "#f59e0b" },
-    { name: "TOTAL",       value: r.total_value,            color: "#f97316" },
+    ...(mods.redispatch  ? [{ name: "Redispatch",    value: r.redispatch_value,       color: "#3b82f6" }] : []),
+    ...(mods.curtailment ? [{ name: "Curtailment",   value: r.curtailment_value,      color: "#8b5cf6" }] : []),
+    ...(mods.capacity    ? [{ name: "Capacity Mkt",  value: r.capacity_market_value,  color: "#2563eb" }] : []),
+    ...(mods.cp_avoid    ? [{ name: "CP Avoidance",  value: r.cp_avoidance_value,     color: "#16a34a" }] : []),
+    ...(mods.arbitrage   ? [{ name: "Energy Arb",    value: r.arbitrage_value,        color: "#0ea5e9" }] : []),
+    ...(mods.reserves    ? [{ name: "Reserves",      value: r.reserve_value,          color: "#f97316" }] : []),
+    ...(mods.cap_defer   ? [{ name: "Cap Deferral",  value: r.capital_deferral_value, color: "#f59e0b" }] : []),
+    { name: "TOTAL", value: r.total_value, color: "#22c55e" },
   ];
 
   return (
@@ -583,14 +866,53 @@ export default function GridFlexSim() {
           Constraint-Relieved Dispatch Model + Topology Leverage
         </h1>
         <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-          <div style={{ fontSize: 11, color: "#7a90a8" }}>
-            {p.mw_flex} MW flex load shed × {p.topology_leverage}x leverage = {(p.mw_flex * p.delivery_factor * p.coincidence_factor * p.topology_leverage).toFixed(1)} MW redispatch equivalent —
-            fully relieves constraint at <span style={{ color: "#06b6d4" }}>{r.mw_to_fully_relieve.toFixed(1)} MW installed</span>
-          </div>
-          <div style={{ fontSize: 10, fontFamily: "monospace", color: confColor, background: confColor + "15", border: "1px solid " + confColor + "40", borderRadius: 4, padding: "2px 8px" }}>
-            {r.reduction_fraction >= 1.0 ? "CONSTRAINT FULLY RELIEVED" : fmtPct(r.reduction_fraction) + " CONSTRAINT RELIEVED"}
-          </div>
+          {mods.redispatch ? (
+            <div style={{ fontSize: 11, color: "#7a90a8" }}>
+              {p.mw_flex} MW flex load shed × {p.topology_leverage}x leverage = {(p.mw_flex * p.delivery_factor * p.coincidence_factor * p.topology_leverage).toFixed(1)} MW redispatch equivalent —
+              fully relieves constraint at <span style={{ color: "#06b6d4" }}>{r.mw_to_fully_relieve.toFixed(1)} MW installed</span>
+            </div>
+          ) : (
+            <div style={{ fontSize: 11, color: "#7a90a8" }}>
+              {p.mw_flex} MW × {fmtPct(p.delivery_factor)} delivery × {fmtPct(p.cp_coincidence)} CP coincidence = <span style={{ color: "#16a34a" }}>{(p.mw_flex * p.delivery_factor * p.cp_coincidence).toFixed(1)} MW dependable CP reduction</span>
+            </div>
+          )}
+          {mods.redispatch && (
+            <div style={{ fontSize: 10, fontFamily: "monospace", color: confColor, background: confColor + "15", border: "1px solid " + confColor + "40", borderRadius: 4, padding: "2px 8px" }}>
+              {r.reduction_fraction >= 1.0 ? "CONSTRAINT FULLY RELIEVED" : fmtPct(r.reduction_fraction) + " CONSTRAINT RELIEVED"}
+            </div>
+          )}
         </div>
+        {/* Market type selector — drives which value streams apply */}
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 12, flexWrap: "wrap" }}>
+          <span style={{ fontSize: 9, fontFamily: "monospace", color: "#4a6080", letterSpacing: "0.12em" }}>MARKET TYPE</span>
+          <div style={{ display: "flex", background: "#0b1520", border: "1px solid #1e3a5a", borderRadius: 5, overflow: "hidden" }}>
+            {Object.values(MARKET_TYPES).map((mt) => {
+              const active = market === mt.key;
+              return (
+                <button
+                  key={mt.key}
+                  onClick={() => setMarket(mt.key)}
+                  style={{
+                    fontSize: 10, fontFamily: "monospace", fontWeight: 700,
+                    letterSpacing: "0.08em", textTransform: "uppercase",
+                    padding: "6px 14px", border: "none", cursor: "pointer",
+                    background: active ? mt.accent : "transparent",
+                    color: active ? "#fff" : "#7a90a8",
+                    borderRight: "1px solid #1e3a5a",
+                  }}
+                >
+                  {mt.label}
+                </button>
+              );
+            })}
+          </div>
+          <span style={{ fontSize: 10, fontFamily: "monospace", color: marketMeta.accent }}>
+            {market === "rto" && "Redispatch + capacity + reserves + energy arbitrage"}
+            {market === "vi"  && "Capital deferral + reserves + IRP-driven cost delta"}
+            {market === "emc" && "Coincident-peak avoidance + wholesale arbitrage + capital deferral"}
+          </span>
+        </div>
+
         <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 10 }}>
           <input
             value={utilityName}
@@ -600,7 +922,7 @@ export default function GridFlexSim() {
           />
           <button
             onClick={generateOnePager}
-            style={{ fontSize: 10, fontFamily: "monospace", fontWeight: 700, letterSpacing: "0.08em", background: "#2563eb", color: "#fff", border: "none", borderRadius: 4, padding: "6px 14px", cursor: "pointer" }}
+            style={{ fontSize: 10, fontFamily: "monospace", fontWeight: 700, letterSpacing: "0.08em", background: marketMeta.accent, color: "#fff", border: "none", borderRadius: 4, padding: "6px 14px", cursor: "pointer" }}
           >
             GENERATE ONE-PAGER ↗
           </button>
@@ -612,7 +934,8 @@ export default function GridFlexSim() {
         {/* ── LEFT: INPUTS ── */}
         <div>
 
-          {/* Module 3 — Topology Leverage */}
+          {/* Module 3 — Topology Leverage (RTO + VI only — PTDF is a transmission concept) */}
+          {mods.redispatch && (
           <Panel title="Module 3 — Topology Leverage (PTDF)" accent="#06b6d4" badge={{ text: "KEY CONCEPT", color: "#06b6d4" }}>
             <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #06b6d430", paddingLeft: 10 }}>
               At the right node, shedding 1 MW of load can relieve far more than 1 MW of redispatch.
@@ -640,8 +963,10 @@ export default function GridFlexSim() {
               </div>
             </div>
           </Panel>
+          )}
 
-          {/* Module 2 — Base Case */}
+          {/* Module 2 — Base Case (Redispatch) — RTO + VI only */}
+          {mods.redispatch && (
           <Panel title="Module 2 — Base Case (Constrained)" accent="#3b82f6">
             <Slider label="Redispatch Required to Relieve Constraint" value={p.mw_redisp}
               display={p.mw_redisp + " MW"} onChange={set("mw_redisp")} min={1} max={500} step={5}
@@ -650,13 +975,92 @@ export default function GridFlexSim() {
               onChange={set("h_bind")} min={50} max={2000} step={10} note="Hours/yr constraint actually binds" />
             <Slider label="Redispatch Price Differential" value={p.price_diff} display={"$" + p.price_diff + "/MWh"}
               onChange={set("price_diff")} min={10} max={150} step={1} note="Cost gap: constrained gen vs. substitute gen" />
-            <Slider label="Total Zone Curtailment" value={p.mwh_curt} display={(p.mwh_curt / 1000).toFixed(0) + "K MWh"}
-              onChange={set("mwh_curt")} min={1000} max={500000} step={1000} note="Annual curtailment in zone" />
-            <Slider label="Curtailment Attribution" value={p.curt_attrib} display={fmtPct(p.curt_attrib)}
-              onChange={set("curt_attrib")} min={0.05} max={1.0} step={0.05} note="Share caused by this constraint" />
-            <Slider label="Curtailed Energy Value" value={p.curt_mwh_value} display={"$" + p.curt_mwh_value + "/MWh"}
-              onChange={set("curt_mwh_value")} min={10} max={120} step={1} note="Marginal value of recovered energy" />
+            {mods.curtailment && (<>
+              <Slider label="Total Zone Curtailment" value={p.mwh_curt} display={(p.mwh_curt / 1000).toFixed(0) + "K MWh"}
+                onChange={set("mwh_curt")} min={1000} max={500000} step={1000} note="Annual curtailment in zone" />
+              <Slider label="Curtailment Attribution" value={p.curt_attrib} display={fmtPct(p.curt_attrib)}
+                onChange={set("curt_attrib")} min={0.05} max={1.0} step={0.05} note="Share caused by this constraint" />
+              <Slider label="Curtailed Energy Value" value={p.curt_mwh_value} display={"$" + p.curt_mwh_value + "/MWh"}
+                onChange={set("curt_mwh_value")} min={10} max={120} step={1} note="Marginal value of recovered energy" />
+            </>)}
           </Panel>
+          )}
+
+          {/* NEW — Capacity Market Revenue — RTO only */}
+          {mods.capacity && (
+          <Panel title="Module 2b — Capacity Market Revenue" accent="#2563eb" badge={{ text: "RTO / ISO", color: "#2563eb" }}>
+            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #2563eb30", paddingLeft: 10 }}>
+              DER flex load registered as a capacity resource earns the zonal clearing
+              price × MW × accreditation factor. PJM BRA $200/MW-day, MISO PRA ~$80/MW-day,
+              NYISO NYC zone highest. Accreditation (ELCC) typically 50–70% for summer-peaking DR.
+            </div>
+            <Slider label="Capacity Clearing Price ($/MW-day)" value={p.capacity_price_mw_day}
+              display={"$" + p.capacity_price_mw_day + "/MW-day"}
+              onChange={set("capacity_price_mw_day")} min={0} max={500} step={10}
+              note={"Annualized: $" + (p.capacity_price_mw_day * 365 / 1000).toFixed(0) + "K/MW-yr pre-accreditation"} />
+            <Slider label="Accreditation (ELCC factor)" value={p.capacity_accreditation}
+              display={fmtPct(p.capacity_accreditation)}
+              onChange={set("capacity_accreditation")} min={0.3} max={1.0} step={0.05}
+              note="Fraction of nameplate MW that counts toward capacity obligation" />
+            <div style={{ background: "#2563eb10", border: "1px solid #2563eb30", borderRadius: 5, padding: "8px 10px", marginTop: 6, fontSize: 11, fontFamily: "monospace", color: "#2563eb" }}>
+              Annual capacity revenue: <span style={{ fontWeight: 700 }}>{fmtD(r.capacity_market_value)}</span>
+              {" "}({p.mw_flex} MW × ${p.capacity_price_mw_day}/day × 365 × {fmtPct(p.capacity_accreditation)})
+            </div>
+          </Panel>
+          )}
+
+          {/* NEW — Coincident Peak Avoidance — EMC / muni only */}
+          {mods.cp_avoid && (
+          <Panel title="Module 2c — Coincident Peak Avoidance" accent="#16a34a" badge={{ text: "EMC HEADLINE", color: "#16a34a" }}>
+            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #16a34a30", paddingLeft: 10 }}>
+              Distribution cooperatives are billed by the G&T on a coincident-peak (CP)
+              determinant. A 1 MW flex load online during the CP hour reduces the billed
+              MW on <em>both</em> the G&T demand charge and the transmission service (NITS)
+              charge. This is typically the largest single dollar lever for a coop.
+            </div>
+            <Slider label="G&T Demand Charge ($/kW-month on CP)" value={p.cp_charge_kw_month}
+              display={"$" + p.cp_charge_kw_month.toFixed(2) + "/kW-mo"}
+              onChange={set("cp_charge_kw_month")} min={0} max={15} step={0.25}
+              note={"Annualized: $" + (p.cp_charge_kw_month * 12).toFixed(0) + "/kW-yr on CP"} />
+            <Slider label="Transmission Charge ($/kW-month on CP)" value={p.trans_charge_kw_month}
+              display={"$" + p.trans_charge_kw_month.toFixed(2) + "/kW-mo"}
+              onChange={set("trans_charge_kw_month")} min={0} max={8} step={0.25}
+              note="NITS or bundled transmission service rate on the CP determinant" />
+            <Slider label="CP Coincidence Factor" value={p.cp_coincidence}
+              display={fmtPct(p.cp_coincidence)}
+              onChange={set("cp_coincidence")} min={0.3} max={1.0} step={0.05}
+              note="Probability flex load is online during the billed CP hour" />
+            <div style={{ background: "#16a34a10", border: "1px solid #16a34a30", borderRadius: 5, padding: "8px 10px", marginTop: 6, fontSize: 11, fontFamily: "monospace", color: "#16a34a" }}>
+              Annual CP avoidance: <span style={{ fontWeight: 700 }}>{fmtD(r.cp_avoidance_value)}</span>
+              {" "}({p.mw_flex}×1000 kW × {fmtPct(p.delivery_factor)} delivery × {fmtPct(p.cp_coincidence)} CP coinc × ${(p.cp_charge_kw_month + p.trans_charge_kw_month).toFixed(2)}/kW-mo × 12)
+            </div>
+          </Panel>
+          )}
+
+          {/* NEW — Energy Arbitrage — RTO + EMC */}
+          {mods.arbitrage && (
+          <Panel title="Module 2d — Energy Arbitrage" accent="#0ea5e9">
+            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #0ea5e930", paddingLeft: 10 }}>
+              Pre-cool during off-peak hours (cheap $/MWh) and dispatch during peak
+              hours (expensive $/MWh). Independent of whether a constraint is binding —
+              pure time-shift value driven by the hour-to-hour price spread.
+            </div>
+            <Slider label="Peak vs Off-Peak $/MWh Spread" value={p.arb_spread_mwh}
+              display={"$" + p.arb_spread_mwh + "/MWh"}
+              onChange={set("arb_spread_mwh")} min={0} max={120} step={2}
+              note={market === "emc"
+                ? "Spread on wholesale purchase cost (coop pays G&T less during off-peak)"
+                : "LMP spread between peak and off-peak hours"} />
+            <Slider label="Arbitrageable Hours / Year" value={p.arb_hours_per_year}
+              display={p.arb_hours_per_year + " hrs"}
+              onChange={set("arb_hours_per_year")} min={0} max={2000} step={50}
+              note="Hours/yr where peak-offpeak spread justifies dispatching" />
+            <div style={{ background: "#0ea5e910", border: "1px solid #0ea5e930", borderRadius: 5, padding: "8px 10px", marginTop: 6, fontSize: 11, fontFamily: "monospace", color: "#0ea5e9" }}>
+              Annual arbitrage: <span style={{ fontWeight: 700 }}>{fmtD(r.arbitrage_value)}</span>
+              {" "}({p.mw_flex} MW × {fmtPct(p.delivery_factor)} delivery × ${p.arb_spread_mwh}/MWh × {p.arb_hours_per_year} hrs)
+            </div>
+          </Panel>
+          )}
 
           {/* Module 4 — Flex Load Intervention */}
           <Panel title="Module 4 — Flex Load Intervention" accent="#8b5cf6">
@@ -664,11 +1068,16 @@ export default function GridFlexSim() {
               onChange={set("mw_flex")} min={1} max={100} step={1}
               note={"MW of flex load at target node (" + r.mw_to_fully_relieve.toFixed(1) + " MW fully relieves constraint)"} />
             <Slider label="Delivery Factor" value={p.delivery_factor} display={fmtPct(p.delivery_factor)}
-              onChange={set("delivery_factor")} min={0.3} max={1.0} step={0.05} note="Probability load responds when dispatched" />
-            <Slider label="Coincidence Factor" value={p.coincidence_factor} display={fmtPct(p.coincidence_factor)}
-              onChange={set("coincidence_factor")} min={0.2} max={1.0} step={0.05} note="Overlap of flex hours with constraint hours" />
-            <Slider label="Curtailment Mitigation" value={p.curt_mitigation} display={fmtPct(p.curt_mitigation)}
-              onChange={set("curt_mitigation")} min={0.05} max={1.0} step={0.05} note="Share of attributed curtailment recoverable" />
+              onChange={set("delivery_factor")} min={0.3} max={1.0} step={0.05} note="Probability load responds when dispatched — derates reserves, CP avoidance, arbitrage" />
+            {mods.redispatch && (
+              <Slider label="Coincidence Factor (binding-hour overlap)" value={p.coincidence_factor} display={fmtPct(p.coincidence_factor)}
+                onChange={set("coincidence_factor")} min={0.2} max={1.0} step={0.05}
+                note="Fraction of binding hours where flex is operational — drives redispatch + curtailment math only" />
+            )}
+            {mods.curtailment && (
+              <Slider label="Curtailment Mitigation" value={p.curt_mitigation} display={fmtPct(p.curt_mitigation)}
+                onChange={set("curt_mitigation")} min={0.05} max={1.0} step={0.05} note="Share of attributed curtailment recoverable" />
+            )}
           </Panel>
 
           {/* Module 5 — Dispatch Timing */}
@@ -734,20 +1143,63 @@ export default function GridFlexSim() {
               </div>
             </div>
             <div style={{ fontSize: 10, color: "#3d5068", fontFamily: "monospace", marginTop: 10, borderTop: "1px solid #0f1c2a", paddingTop: 8, lineHeight: 1.7 }}>
-              Coincidence factor ({fmtPct(p.coincidence_factor)}) reflects how often this dispatch window overlaps with actual binding hours.
-              Set higher when BA forecast is reliable and peak timing is consistent day-to-day.
+              {(() => {
+                const suggestedCF = Math.min(0.95, 0.50 + (p.window_hours - 1) * 0.10);
+                const cfDelta = (suggestedCF - p.coincidence_factor).toFixed(2);
+                const cfStatus = Math.abs(suggestedCF - p.coincidence_factor) < 0.05
+                  ? { color: "#4ade80", label: "aligned" }
+                  : suggestedCF > p.coincidence_factor
+                  ? { color: "#f59e0b", label: "conservative — window supports higher" }
+                  : { color: "#f87171", label: "aggressive vs. window size" };
+                return (
+                  <div style={{ background: "#0a111a", border: "1px solid #0f1c2a", borderRadius: 4, padding: "8px 10px" }}>
+                    <div style={{ color: "#4a7090", marginBottom: 4 }}>
+                      Dispatch window ({p.window_hours} hr) → suggested coincidence factor:{" "}
+                      <span style={{ color: "#06b6d4", fontWeight: 700 }}>{fmtPct(suggestedCF)}</span>
+                    </div>
+                    <div>
+                      Current setting: <span style={{ color: "#e2e8f0" }}>{fmtPct(p.coincidence_factor)}</span>
+                      {" — "}
+                      <span style={{ color: cfStatus.color }}>{cfStatus.label}</span>
+                    </div>
+                    <div style={{ color: "#2d4a63", marginTop: 4, fontSize: 9, letterSpacing: "0.05em" }}>
+                      BASIS: 1-hr window → 60% | 2-hr → 70% | 3-hr → 80% | 4-hr → 90% — adjust for forecast reliability
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           </Panel>
 
           {/* Module 6 — Capital Deferral */}
-          <Panel title="Module 6 — Capital Deferral" accent="#f59e0b">
+          {mods.cap_defer && (
+          <Panel title="Module 6 — Capital Deferral" accent="#f59e0b" badge={{ text: "STRUCTURAL OVERLAY", color: "#f59e0b" }}>
+            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #f59e0b30", paddingLeft: 10 }}>
+              One-time NPV from pushing out a planned capital project. Per the
+              Pilot-Grade Process — kept as a separate overlay, not mixed into
+              production cost delta. Deferral is realized only when deployment
+              is sufficient: scaled by constraint relief (RTO/VI) or CP-load
+              reduction (EMC).
+            </div>
             <Slider label="Infrastructure Project Cost" value={p.capex / 1e6} display={"$" + (p.capex / 1e6).toFixed(0) + "M"}
               onChange={(v) => set("capex")(v * 1e6)} min={1} max={200} step={1} note="Substation / feeder / interface upgrade cost" />
             <Slider label="WACC" value={p.wacc} display={fmtPct(p.wacc)}
               onChange={set("wacc")} min={0.03} max={0.12} step={0.005} note="Utility weighted average cost of capital" />
             <Slider label="Deferral Years" value={p.years_deferral} display={p.years_deferral + " yrs"}
               onChange={set("years_deferral")} min={1} max={10} step={1} note="Years the upgrade can be delayed" />
+            <Slider label="MW Threshold for Full Deferral" value={p.mw_deferral_threshold} display={p.mw_deferral_threshold + " MW"}
+              onChange={set("mw_deferral_threshold")} min={1} max={500} step={5}
+              note={mods.redispatch
+                ? "MW of constraint relief required to push out the project"
+                : "MW of CP-coincident load reduction required to push out the project"} />
+            <div style={{ background: "#f59e0b10", border: "1px solid #f59e0b30", borderRadius: 5, padding: "8px 10px", marginTop: 6, fontSize: 11, fontFamily: "monospace", color: "#f59e0b" }}>
+              Full deferral NPV: {fmtD(r.capital_deferral_full)} ×{" "}
+              <span style={{ color: r.deferral_realized >= 0.95 ? "#22c55e" : r.deferral_realized >= 0.5 ? "#f59e0b" : "#ef4444", fontWeight: 700 }}>
+                {fmtPct(r.deferral_realized)} realized
+              </span>{" "}= <span style={{ fontWeight: 700 }}>{fmtD(r.capital_deferral_value)}</span>
+            </div>
           </Panel>
+          )}
 
           {/* Module 7 — Building Incentive */}
           <Panel title="Module 7 — Flex Load Incentive" accent="#f472b6">
@@ -773,27 +1225,64 @@ export default function GridFlexSim() {
               onChange={set("facility_incentive_kw_yr")} min={10} max={100} step={5} note="Monthly bill credit to facility — funded from GridFlex contract revenue" />
           </Panel>
 
+          {/* Module 9 — Operating Reserve Value */}
+          {mods.reserves && (
+          <Panel title="Module 9 — Operating Reserve Value" accent="#f97316" badge={{ text: "RESERVES", color: "#f97316" }}>
+            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #f97316 30", paddingLeft: 10 }}>
+              Flex load that can respond in seconds qualifies as spinning reserve — a NERC BAL-002 obligation
+              the utility must otherwise hold as generator headroom. With AI/data center load growth,
+              reserve requirements are rising faster than new capacity can be built.
+              Load flex is an underpriced solution to the reserve burden.
+            </div>
+            <Slider label="Reserve-Eligible Fraction" value={p.reserve_eligible_pct} display={fmtPct(p.reserve_eligible_pct)}
+              onChange={set("reserve_eligible_pct")} min={0.2} max={1.0} step={0.05}
+              note="% of flex MW qualifying as spinning/non-spinning reserve (response-time + telemetry gates)" />
+            <Slider label="Reserve Capacity Credit ($/kW-yr)" value={p.reserve_rate_kw_yr} display={"$" + p.reserve_rate_kw_yr + "/kW-yr"}
+              onChange={set("reserve_rate_kw_yr")} min={2} max={30} step={1}
+              note={"PJM reference ~$4–8/kW-yr spin, ~$2–4/kW-yr non-spin | revenue derated by Delivery factor"} />
+            <div style={{ fontSize: 10, color: "#3d5068", fontFamily: "monospace", marginTop: 4 }}>
+              At current settings: {p.mw_flex} MW × 1000 × {fmtPct(p.delivery_factor)} delivery × {fmtPct(p.reserve_eligible_pct)} eligible × ${p.reserve_rate_kw_yr}/kW-yr = <span style={{ color: "#f97316" }}>{fmtD(r.reserve_value)}/yr</span>
+            </div>
+          </Panel>
+          )}
+
         </div>
 
         {/* ── RIGHT: RESULTS ── */}
         <div>
 
-          {/* Summary metric row */}
+          {/* Summary metric row — headline KPI box swaps by market type */}
           <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 9, marginBottom: 14 }}>
-            <MBox label="Redispatch Equiv." value={Math.min(r.mw_redisp_equivalent, p.mw_redisp).toFixed(1) + " MW"}
-              sub={r.mw_effective.toFixed(1) + " MW shed × " + p.topology_leverage + "x leverage"}
-              color="#06b6d4" tag="TOPOLOGY OUTPUT" />
-            <MBox label="Constraint Relieved" value={fmtPct(r.reduction_fraction)}
-              sub={"Fully relieved at " + r.mw_to_fully_relieve.toFixed(1) + " MW installed"}
-              color={r.reduction_fraction >= 1.0 ? "#22c55e" : "#f59e0b"} tag="RELIEF FRACTION" />
-            <MBox label="Production Cost Delta" value={fmtD(r.production_cost_delta)}
-              sub={"Redisp: " + fmtD(r.redispatch_value) + " | Curt: " + fmtD(r.curtailment_value)}
-              color="#22c55e" tag="ANNUAL BENEFIT" />
-            <MBox label="Capital Deferral (NPV)" value={fmtD(r.capital_deferral_value)}
-              sub={p.years_deferral + " yrs @ " + fmtPct(p.wacc)}
-              color="#f59e0b" tag="STRUCTURAL OVERLAY" />
+            <MBox label="Effective Load Shed" value={r.mw_effective.toFixed(1) + " MW"}
+              sub={p.mw_flex + " MW × " + fmtPct(p.delivery_factor) + " × " + fmtPct(p.coincidence_factor)}
+              color="#06b6d4" tag="DEPENDABLE MW" />
+            {market === "rto" && (
+              <MBox label="Production Cost Δ + Capacity" value={fmtD(r.production_cost_delta + r.capacity_market_value)}
+                sub={"Redisp: " + fmtD(r.redispatch_value) + " | Cap mkt: " + fmtD(r.capacity_market_value)}
+                color="#22c55e" tag="ANNUAL BENEFIT (RTO)" />
+            )}
+            {market === "vi" && (
+              <MBox label="Production Cost Delta" value={fmtD(r.production_cost_delta)}
+                sub={"Redispatch only — reserves & deferral counted separately"}
+                color="#22c55e" tag="ANNUAL BENEFIT (VI)" />
+            )}
+            {market === "emc" && (
+              <MBox label="CP Avoidance + Arbitrage" value={fmtD(r.cp_avoidance_value + r.arbitrage_value)}
+                sub={"CP: " + fmtD(r.cp_avoidance_value) + " | Arb: " + fmtD(r.arbitrage_value)}
+                color="#16a34a" tag="ANNUAL BENEFIT (EMC)" />
+            )}
+            <MBox label="Total Value Stack" value={fmtD(r.total_value)}
+              sub={"$" + r.dollars_per_kw_yr.toFixed(0) + "/kW-yr addressable"}
+              color="#22c55e" tag="ANNUAL TOTAL" />
+            {mods.cap_defer ? (
+              <MBox label="Capital Deferral (NPV)" value={fmtD(r.capital_deferral_value)}
+                sub={p.years_deferral + " yrs @ " + fmtPct(p.wacc)}
+                color="#f59e0b" tag="STRUCTURAL OVERLAY" />
+            ) : (
+              <MBox label="—" value="—" sub="" color="#3d5068" tag="—" />
+            )}
             <MBox label="Optimal Deployment" value={optimal ? optimal.mw + " MW" : "—"}
-              sub={optimal ? fmtD(optimal.production_cost_delta) + "/yr" : ""}
+              sub={optimal ? fmtD(optimal.addressable_annual) + "/yr addressable" : ""}
               color="#a78bfa" tag="OPTIMAL MW" />
           </div>
 
@@ -920,45 +1409,94 @@ export default function GridFlexSim() {
           {/* ══ FORMULA CHAIN TAB ══ */}
           {tab === "formulas" && (
             <>
-              <Panel title="Formula Sequence — With Topology Leverage" accent="#22c55e">
+              <Panel title={"Formula Sequence — " + marketMeta.label} accent="#22c55e">
+                {/* Step 1 — common to all markets: dependable MW */}
                 <FRow num={1} formula="MW_effective = MW_flex × Delivery × Coincidence"
                   inputs={p.mw_flex + " × " + p.delivery_factor + " × " + p.coincidence_factor}
                   result={r.mw_effective.toFixed(2) + " MW dependable shed"} color="#22c55e" />
-                <FRow num="2★" formula="MW_redisp_equiv = MW_effective × Topology_leverage"
-                  inputs={r.mw_effective.toFixed(2) + " MW × " + p.topology_leverage + "x leverage"}
-                  result={r.mw_redisp_equivalent.toFixed(1) + " MW redispatch equivalent"}
-                  color="#06b6d4" highlight={true} />
-                <FRow num="3★" formula="Reduction_fraction = MW_redisp_equiv / MW_redisp_required  [cap 100%]"
-                  inputs={r.mw_redisp_equivalent.toFixed(1) + " ÷ " + p.mw_redisp + " required"}
-                  result={fmtPct(r.reduction_fraction) + " of constraint relieved"}
-                  color="#06b6d4" highlight={true} />
-                <FRow num={4} formula="E_redisp_base = MW_redisp × H_bind"
-                  inputs={p.mw_redisp + " MW × " + p.h_bind + " hrs"}
-                  result={fmtMWh(r.e_redisp_base)} color="#3b82f6" />
-                <FRow num={5} formula="E_redisp_saved = E_redisp_base × Reduction_fraction"
-                  inputs={fmtMWh(r.e_redisp_base) + " × " + fmtPct(r.reduction_fraction)}
-                  result={fmtMWh(r.e_redisp_saved)} color="#3b82f6" />
-                <FRow num={6} formula="Redispatch_value = E_redisp_saved × $/MWh_diff"
-                  inputs={fmtMWh(r.e_redisp_saved) + " × $" + p.price_diff}
-                  result={fmtD(r.redispatch_value)} color="#3b82f6" />
-                <FRow num={7} formula="Curtailment_attrib = MWh_curt × Attribution"
-                  inputs={fmtMWh(p.mwh_curt) + " × " + fmtPct(p.curt_attrib)}
-                  result={fmtMWh(r.curtailment_attrib)} color="#8b5cf6" />
-                <FRow num={8} formula="Curtailment_recovered = Attrib × Mitigation × Reduction"
-                  inputs={fmtMWh(r.curtailment_attrib) + " × " + fmtPct(p.curt_mitigation) + " × " + fmtPct(r.reduction_fraction)}
-                  result={fmtMWh(r.curtailment_recovered)} color="#8b5cf6" />
-                <FRow num={9} formula="Curtailment_value = Recovered × $/MWh"
-                  inputs={fmtMWh(r.curtailment_recovered) + " × $" + p.curt_mwh_value}
-                  result={fmtD(r.curtailment_value)} color="#8b5cf6" />
-                <FRow num={10} formula="Production_cost_delta = Redispatch_value + Curtailment_value"
-                  inputs={fmtD(r.redispatch_value) + " + " + fmtD(r.curtailment_value)}
-                  result={fmtD(r.production_cost_delta)} color="#22c55e" />
-                <FRow num={11} formula="Capital_deferral = CapEx × (1 − 1/(1+WACC)^Years)"
-                  inputs={"$" + (p.capex / 1e6).toFixed(0) + "M × " + fmtPct(p.wacc) + " × " + p.years_deferral + " yrs"}
-                  result={fmtD(r.capital_deferral_value)} color="#f59e0b" />
-                <FRow num={12} formula="Total_value = Production_cost_delta + Capital_deferral"
-                  inputs={fmtD(r.production_cost_delta) + " + " + fmtD(r.capital_deferral_value)}
-                  result={fmtD(r.total_value)} color="#f97316" />
+
+                {/* Redispatch + curtailment chain — RTO + VI only */}
+                {mods.redispatch && (<>
+                  <FRow num="2★" formula="MW_redisp_equiv = MW_effective × Topology_leverage"
+                    inputs={r.mw_effective.toFixed(2) + " MW × " + p.topology_leverage + "x leverage"}
+                    result={r.mw_redisp_equivalent.toFixed(1) + " MW redispatch equivalent"}
+                    color="#06b6d4" highlight={true} />
+                  <FRow num="3★" formula="Reduction_fraction = MW_redisp_equiv / MW_redisp_required  [cap 100%]"
+                    inputs={r.mw_redisp_equivalent.toFixed(1) + " ÷ " + p.mw_redisp + " required"}
+                    result={fmtPct(r.reduction_fraction) + " of constraint relieved"}
+                    color="#06b6d4" highlight={true} />
+                  <FRow num={4} formula="E_redisp_base = MW_redisp × H_bind"
+                    inputs={p.mw_redisp + " MW × " + p.h_bind + " hrs"}
+                    result={fmtMWh(r.e_redisp_base)} color="#3b82f6" />
+                  <FRow num={5} formula="E_redisp_saved = E_redisp_base × Reduction_fraction"
+                    inputs={fmtMWh(r.e_redisp_base) + " × " + fmtPct(r.reduction_fraction)}
+                    result={fmtMWh(r.e_redisp_saved)} color="#3b82f6" />
+                  <FRow num={6} formula="Redispatch_value = E_redisp_saved × $/MWh_diff"
+                    inputs={fmtMWh(r.e_redisp_saved) + " × $" + p.price_diff}
+                    result={fmtD(r.redispatch_value)} color="#3b82f6" />
+                </>)}
+                {mods.curtailment && (<>
+                  <FRow num={7} formula="Curtailment_attrib = MWh_curt × Attribution"
+                    inputs={fmtMWh(p.mwh_curt) + " × " + fmtPct(p.curt_attrib)}
+                    result={fmtMWh(r.curtailment_attrib)} color="#8b5cf6" />
+                  <FRow num={8} formula="Curtailment_recovered = Attrib × Mitigation × Reduction"
+                    inputs={fmtMWh(r.curtailment_attrib) + " × " + fmtPct(p.curt_mitigation) + " × " + fmtPct(r.reduction_fraction)}
+                    result={fmtMWh(r.curtailment_recovered)} color="#8b5cf6" />
+                  <FRow num={9} formula="Curtailment_value = Recovered × $/MWh"
+                    inputs={fmtMWh(r.curtailment_recovered) + " × $" + p.curt_mwh_value}
+                    result={fmtD(r.curtailment_value)} color="#8b5cf6" />
+                </>)}
+                {mods.redispatch && (
+                  <FRow num={10} formula="Production_cost_delta = Redispatch_value + Curtailment_value"
+                    inputs={fmtD(r.redispatch_value) + " + " + fmtD(r.curtailment_value)}
+                    result={fmtD(r.production_cost_delta)} color="#22c55e" />
+                )}
+
+                {/* Capacity market — RTO only */}
+                {mods.capacity && (
+                  <FRow num="C1" formula="Capacity_value = MW_flex × $/MW-day × 365 × ELCC"
+                    inputs={p.mw_flex + " MW × $" + p.capacity_price_mw_day + " × 365 × " + fmtPct(p.capacity_accreditation)}
+                    result={fmtD(r.capacity_market_value)} color="#2563eb" />
+                )}
+
+                {/* CP avoidance — EMC only */}
+                {mods.cp_avoid && (
+                  <FRow num="P1" formula="CP_avoidance = MW × 1000 × Delivery × CP_coinc × ($G&T + $NITS)/kW-mo × 12"
+                    inputs={p.mw_flex + " × 1000 × " + fmtPct(p.delivery_factor) + " × " + fmtPct(p.cp_coincidence) + " × $" + (p.cp_charge_kw_month + p.trans_charge_kw_month).toFixed(2) + "/kW-mo × 12"}
+                    result={fmtD(r.cp_avoidance_value)} color="#16a34a" highlight={true} />
+                )}
+
+                {/* Energy arbitrage — RTO + EMC */}
+                {mods.arbitrage && (
+                  <FRow num="A1" formula="Arbitrage_value = MW × Delivery × $/MWh_spread × Hours/yr"
+                    inputs={p.mw_flex + " × " + fmtPct(p.delivery_factor) + " × $" + p.arb_spread_mwh + "/MWh × " + p.arb_hours_per_year + " hrs"}
+                    result={fmtD(r.arbitrage_value)} color="#0ea5e9" />
+                )}
+
+                {/* Reserves — RTO + VI */}
+                {mods.reserves && (
+                  <FRow num={12} formula="Reserve_value = MW × 1000 × Delivery × Eligible × $/kW-yr"
+                    inputs={p.mw_flex + " × 1000 × " + fmtPct(p.delivery_factor) + " × " + fmtPct(p.reserve_eligible_pct) + " × $" + p.reserve_rate_kw_yr}
+                    result={fmtD(r.reserve_value) + "/yr"} color="#f97316" />
+                )}
+
+                {/* Capital deferral — all markets */}
+                {mods.cap_defer && (<>
+                  <FRow num={11} formula="Cap_deferral_full = CapEx × (1 − 1/(1+WACC)^Years)"
+                    inputs={"$" + (p.capex / 1e6).toFixed(0) + "M × " + fmtPct(p.wacc) + " × " + p.years_deferral + " yrs"}
+                    result={fmtD(r.capital_deferral_full)} color="#f59e0b" />
+                  <FRow num="11b" formula={mods.redispatch ? "Cap_deferral_realized = Cap_deferral_full × Reduction_fraction" : "Cap_deferral_realized = Cap_deferral_full × min(1, MW_eff_CP / Threshold)"}
+                    inputs={fmtD(r.capital_deferral_full) + " × " + fmtPct(r.deferral_realized) + " realization"}
+                    result={fmtD(r.capital_deferral_value)} color="#f59e0b" highlight={true} />
+                </>)}
+
+                {/* Aggregations */}
+                <FRow num="Σ1" formula="Addressable_annual = sum of recurring annual streams"
+                  inputs={"PCD + Capacity + CP + Arb + Reserves"}
+                  result={fmtD(r.addressable_annual) + "/yr"} color="#22c55e" />
+                <FRow num="Σ2" formula="Total_value = Addressable_annual + Cap_deferral (one-time NPV)"
+                  inputs={fmtD(r.addressable_annual) + " + " + fmtD(r.capital_deferral_value)}
+                  result={fmtD(r.total_value)} color="#22c55e" highlight={true} />
               </Panel>
               <Panel title="Value Composition" accent="#8b5cf6">
                 <ResponsiveContainer width="100%" height={130}>
@@ -988,12 +1526,26 @@ export default function GridFlexSim() {
           )}
           {tab === "optimal" && optimal && (
             <>
-              <Panel title="Optimal MW — Incorporating Topology Leverage" accent="#a78bfa">
+              <Panel title={optimal.regime === "linear_value" ? "Deployment Plan — Linear-Value Market (EMC)" : "Optimal MW — Incorporating Topology Leverage"} accent="#a78bfa">
+                {optimal.regime === "linear_value" && (
+                  <div style={{ background: "#a78bfa12", border: "1px solid #a78bfa30", borderRadius: 5, padding: "10px 12px", marginBottom: 12, fontSize: 11, fontFamily: "monospace", color: "#7a90a8", lineHeight: 1.7 }}>
+                    <span style={{ color: "#a78bfa", fontWeight: 700 }}>Linear-value regime detected.</span>{" "}
+                    Marginal $/kW-yr is constant across MW (CP avoidance + arbitrage scale linearly with deployment).
+                    There is no diminishing-returns optimum — the deployment ceiling is set by site availability,
+                    capital, and CP-load addressable on the system. Optimal MW shown below = your current input;
+                    treat as the planned pilot or program size.
+                  </div>
+                )}
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 14 }}>
                   {[
-                    { label: "MW to fully relieve constraint", value: r.mw_to_fully_relieve.toFixed(1) + " MW", sub: "at " + p.topology_leverage + "x leverage", color: "#06b6d4" },
-                    { label: "Optimal MW (value threshold)",   value: optimal.mw + " MW",                      sub: "marginal value above " + p.threshold_pct + "% of peak", color: "#a78bfa" },
-                    { label: "Value at optimal",               value: fmtD(optimal.production_cost_delta),     sub: "annual production cost delta", color: "#22c55e" },
+                    mods.redispatch
+                      ? { label: "MW to fully relieve constraint", value: r.mw_to_fully_relieve.toFixed(1) + " MW", sub: "at " + p.topology_leverage + "x leverage", color: "#06b6d4" }
+                      : { label: "Dependable CP reduction",        value: (p.mw_flex * p.delivery_factor * p.cp_coincidence).toFixed(1) + " MW", sub: "MW × Delivery × CP coincidence", color: "#16a34a" },
+                    { label: optimal.regime === "linear_value" ? "Planned deployment (= input)" : "Optimal MW (value threshold)",
+                      value: optimal.mw + " MW",
+                      sub: optimal.regime === "linear_value" ? "linear value — no diminishing-returns gate" : "marginal value above " + p.threshold_pct + "% of peak",
+                      color: "#a78bfa" },
+                    { label: "Value at optimal",               value: fmtD(optimal.addressable_annual),         sub: "annual addressable revenue", color: "#22c55e" },
                   ].map((item, i) => (
                     <div key={i} style={{ background: "#070d14", border: "1px solid " + item.color + "30", borderLeft: "2px solid " + item.color, borderRadius: 5, padding: "10px 12px" }}>
                       <div style={{ fontSize: 9, color: "#3d5068", fontFamily: "monospace", marginBottom: 3 }}>{item.label}</div>
@@ -1015,17 +1567,19 @@ export default function GridFlexSim() {
                       tickFormatter={(v) => "$" + v.toFixed(0)} />
                     <Tooltip contentStyle={{ background: "#0b1520", border: "1px solid #0f1c2a", borderRadius: 6, fontFamily: "monospace", fontSize: 11 }}
                       formatter={(v, name) => ({
-                        production_cost_delta: [fmtD(v), "Production Cost Delta"],
+                        addressable_annual: [fmtD(v), "Addressable Revenue"],
                         total_value: [fmtD(v), "Total Value Stack"],
                         marginal_per_kw: ["$" + v.toFixed(0) + "/kW-yr", "Marginal Value"],
                       }[name] || [v, name])}
                       labelFormatter={(l) => l + " MW"} />
-                    <ReferenceLine yAxisId="dollars" x={r.mw_to_fully_relieve} stroke="#06b6d4" strokeWidth={1} strokeDasharray="3 2"
-                      label={{ value: "full relief", position: "top", fill: "#06b6d4", fontSize: 9 }} />
+                    {p.mw_redisp > 0 && r.mw_to_fully_relieve > 0 && (
+                      <ReferenceLine yAxisId="dollars" x={r.mw_to_fully_relieve} stroke="#06b6d4" strokeWidth={1} strokeDasharray="3 2"
+                        label={{ value: "full relief", position: "top", fill: "#06b6d4", fontSize: 9 }} />
+                    )}
                     <ReferenceLine yAxisId="dollars" x={optimal.mw} stroke="#a78bfa" strokeWidth={2} strokeDasharray="6 3"
                       label={{ value: optimal.mw + " MW OPTIMAL", position: "insideTopRight", fill: "#a78bfa", fontSize: 9 }} />
                     <ReferenceLine yAxisId="marginal" y={optimal.cutoff_value} stroke="#ef4444" strokeWidth={1} strokeDasharray="4 2" />
-                    <Area yAxisId="dollars" type="monotone" dataKey="production_cost_delta" stroke="#22c55e" fill="#22c55e15" strokeWidth={2} dot={false} />
+                    <Area yAxisId="dollars" type="monotone" dataKey="addressable_annual" stroke="#22c55e" fill="#22c55e15" strokeWidth={2} dot={false} />
                     <Line yAxisId="dollars" type="monotone" dataKey="total_value" stroke="#f97316" strokeWidth={2} strokeDasharray="5 3" dot={false} />
                     <Line yAxisId="marginal" type="monotone" dataKey="marginal_per_kw" stroke="#06b6d4" strokeWidth={2} dot={false} />
                   </ComposedChart>
@@ -1038,7 +1592,7 @@ export default function GridFlexSim() {
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "monospace" }}>
                     <thead>
                       <tr style={{ borderBottom: "1px solid #1e3a5a" }}>
-                        {["MW", "Redisp Equiv.", "Relief %", "Prod. Cost Delta", "Total Value", "Marginal $/kW-yr", "Decision"].map((h) => (
+                        {["MW", "Redisp Equiv.", "Relief %", "Addressable Rev.", "Total Value", "Marginal $/kW-yr", "Decision"].map((h) => (
                           <th key={h} style={{ padding: "5px 8px", color: "#4a7090", fontWeight: 600, textAlign: "right", fontSize: 10 }}>{h}</th>
                         ))}
                       </tr>
@@ -1053,9 +1607,9 @@ export default function GridFlexSim() {
                         return (
                           <tr key={i} style={{ borderBottom: "1px solid #0a1520", background: isOpt ? "#a78bfa10" : "transparent" }}>
                             <td style={{ padding: "4px 8px", color: isOpt ? "#a78bfa" : "#e2e8f0", fontWeight: isOpt ? 700 : 400, textAlign: "right" }}>{s.mw}</td>
-                            <td style={{ padding: "4px 8px", color: "#06b6d4", textAlign: "right" }}>{Math.min(s.mw_redisp_equivalent, p.mw_redisp).toFixed(0)} MW</td>
-                            <td style={{ padding: "4px 8px", color: s.reduction_fraction >= 1 ? "#22c55e" : "#f59e0b", textAlign: "right" }}>{fmtPct(s.reduction_fraction)}</td>
-                            <td style={{ padding: "4px 8px", color: "#22c55e", textAlign: "right" }}>{fmtD(s.production_cost_delta)}</td>
+                            <td style={{ padding: "4px 8px", color: "#06b6d4", textAlign: "right" }}>{p.mw_redisp > 0 ? Math.min(s.mw_redisp_equivalent, p.mw_redisp).toFixed(0) + " MW" : "—"}</td>
+                            <td style={{ padding: "4px 8px", color: s.reduction_fraction >= 1 ? "#22c55e" : "#f59e0b", textAlign: "right" }}>{p.mw_redisp > 0 ? fmtPct(s.reduction_fraction) : "—"}</td>
+                            <td style={{ padding: "4px 8px", color: "#22c55e", textAlign: "right" }}>{fmtD(s.addressable_annual)}</td>
                             <td style={{ padding: "4px 8px", color: "#f97316", textAlign: "right" }}>{fmtD(s.total_value)}</td>
                             <td style={{ padding: "4px 8px", color: above ? "#22c55e" : "#ef4444", textAlign: "right" }}>${s.marginal_per_kw.toFixed(0)}</td>
                             <td style={{ padding: "4px 8px", textAlign: "right" }}>
@@ -1176,12 +1730,24 @@ export default function GridFlexSim() {
                         </div>
                       ))}
                     </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "10px 14px", background: contract.rim_pass ? "#16a34a12" : "#dc262612", border: "1px solid " + (contract.rim_pass ? "#16a34a40" : "#dc262640"), borderRadius: 6 }}>
-                      <div style={{ fontSize: 10, fontFamily: "monospace", color: contract.rim_pass ? "#4ade80" : "#f87171", fontWeight: 700 }}>
-                        RIM TEST: {contract.rim_pass ? "✓ PASS" : "✗ FAIL"}
-                      </div>
-                      <div style={{ fontSize: 10, color: "#7a90a8" }}>
-                        — GridFlex rate (${Math.round(contract.gridflex_rate_kw_yr)}/kW-yr) is {contract.rim_pass ? "below" : "above"} utility avoided cost (${Math.round(contract.avoided_kw_yr)}/kW-yr)
+                    <div style={{ background: "#0a1118", border: "1px solid #1e4a30", borderRadius: 6, padding: "14px 16px", marginTop: 4 }}>
+                      <div style={{ fontSize: 9, color: "#4ade80", fontFamily: "monospace", letterSpacing: "0.12em", fontWeight: 700, marginBottom: 8 }}>RIM TEST — RATEPAYER IMPACT MEASURE</div>
+                      <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace", lineHeight: 1.9 }}>
+                        <div style={{ marginBottom: 8 }}>
+                          The RIM test asks whether non-participating ratepayers see their rates increase as a result of the program.
+                          This is the hardest test for generic DR — but GridFlex is structured differently.
+                        </div>
+                        <div style={{ borderLeft: "2px solid #4ade8040", paddingLeft: 10, marginBottom: 8 }}>
+                          <div style={{ color: "#4ade80", fontWeight: 700, marginBottom: 4 }}>Why GridFlex passes the RIM argument:</div>
+                          <div>• Constraint relief on a binding corridor reduces system-wide production costs — not just for enrolled buildings</div>
+                          <div>• Every ratepayer on this corridor was already paying the ${Math.round(contract.avoided_kw_yr)}/kW-yr drag through higher dispatch costs</div>
+                          <div>• GridFlex at ${Math.round(contract.gridflex_rate_kw_yr)}/kW-yr captures {fmtPct(p.gridflex_rate_pct)} of savings — the remaining {fmtPct(1 - p.gridflex_rate_pct)} flows back to all ratepayers as lower production costs</div>
+                          <div>• Unlike generic DSM (which reduces utility revenue without broad system benefits), topology-targeted constraint relief benefits the full corridor</div>
+                        </div>
+                        <div style={{ color: "#94a3b8", fontSize: 10 }}>
+                          <span style={{ color: "#f59e0b", fontWeight: 700 }}>NOTE: </span>
+                          Georgia Power and the Georgia PSC actively scrutinize the RIM test. Address this framing explicitly in any utility presentation. Georgia does not yet have a formalized NWA framework — first-mover opportunity to help define it.
+                        </div>
                       </div>
                     </div>
                   </Panel>
@@ -1253,33 +1819,47 @@ export default function GridFlexSim() {
           {tab === "assumptions" && (
             <Panel title="Key Assumptions — What Would Break This Model" accent="#ef4444">
               {[
-                {
+                mods.redispatch && {
                   a: "Topology leverage = " + p.topology_leverage + "x",
-                  note: "This is the most critical assumption in the model. A " + p.topology_leverage + "x leverage means 1 MW of load shed at the target node relieves " + p.topology_leverage + " MW of redispatch. This MUST be validated against actual PTDF data from the network model (PSS/E or similar) before presenting to a utility as anything more than screening-grade. Operational experience identifying the right node is the proxy at this stage — label it explicitly."
+                  note: "Most critical assumption in the model. A " + p.topology_leverage + "x leverage means 1 MW of load shed at the target node relieves " + p.topology_leverage + " MW of redispatch. MUST be validated against actual PTDF data from the network model (PSS/E or similar) before presenting to a utility as anything more than screening-grade. Operational experience identifying the right node is the proxy at this stage — label it explicitly."
                 },
-                {
+                mods.redispatch && {
                   a: "Reduction fraction = " + fmtPct(r.reduction_fraction),
                   note: r.reduction_fraction > 0.7
                     ? "HIGH — the model assumes proportional relief up to 100%. Real topology may be nonlinear — small MW increments near the constraint boundary can have outsized or undersized effects. Validate with contingency modeling before committing to a utility."
                     : "Within credible screening range. Label as engineering estimate pending contingency model validation."
                 },
                 {
-                  a: "Delivery factor = " + fmtPct(p.delivery_factor) + " | Coincidence factor = " + fmtPct(p.coincidence_factor),
-                  note: "Combined effective MW = " + r.mw_effective.toFixed(1) + " MW. Real-world pilot deployments have demonstrated 60–80% peak suppression achievable with advanced flexible load systems under stress conditions. These defaults are conservative and defensible at screening grade."
+                  a: "Delivery factor = " + fmtPct(p.delivery_factor) + (mods.redispatch ? " | Coincidence factor = " + fmtPct(p.coincidence_factor) : " | CP coincidence = " + fmtPct(p.cp_coincidence)),
+                  note: "Delivery factor derates ALL revenue streams that depend on dispatchable performance: reserves, CP avoidance, arbitrage. NERC/PJM ancillary products carry non-performance penalties — using nameplate would overstate value. ELCC accreditation already encodes resource adequacy contribution for capacity revenue, so capacity is not double-derated by delivery."
                 },
-                {
+                mods.redispatch && {
+                  a: "Coincidence factor direction",
+                  note: "This parameter is the fraction of binding hours where flex is operational and dispatchable, NOT the fraction of flex hours that overlap binding. Direction matters: night-shift load with no overlap = 0%; matched-shift with full availability = 100%."
+                },
+                mods.curtailment && {
                   a: "Curtailment attribution = " + fmtPct(p.curt_attrib),
                   note: "Requires constraint logs to validate. The share of zone curtailment caused by this specific constraint varies widely. Engineering estimate is acceptable at screening grade — label it explicitly in any utility presentation and flag it as field-validatable from ISO/RTO curtailment records."
                 },
-                {
+                mods.redispatch && {
                   a: "Redispatch differential = $" + p.price_diff + "/MWh",
                   note: "Validate against actual out-of-merit dispatch records or ISO/RTO public data (OASIS, MISO public reports) for the specific constraint zone. This number can vary significantly by season, time of day, and generation mix. Present as a range."
                 },
-                {
-                  a: "Capital deferral = " + p.years_deferral + " year" + (p.years_deferral > 1 ? "s" : ""),
-                  note: "Load growth uncertainty is high. A 1-year error shifts NPV materially. Deferral timing depends on load growth trajectory, coincident peak trends, and utility planning assumptions — all of which should be sourced from the utility's own IRP or capital plan. Present as a sensitivity range, not a point estimate."
+                mods.cap_defer && {
+                  a: "Capital deferral realization = " + fmtPct(r.deferral_realized),
+                  note: (mods.redispatch
+                    ? "Scaled by constraint relief (reduction fraction). At full relief, full NPV; at partial relief, linear approximation. Real deferral is often binary — the project either moves out or it doesn't. Use this as a screening-grade estimate; firm it up with the utility's own load-growth + planning data."
+                    : "Scaled by CP-coincident MW vs. " + p.mw_deferral_threshold + " MW threshold. Distribution upgrades are deferred when peak load is held below the equipment rating's growth crossing. Validate the threshold against the coop's own planning study.")
                 },
-              ].map((item, i) => (
+                mods.cap_defer && {
+                  a: "Capital deferral years = " + p.years_deferral + " year" + (p.years_deferral > 1 ? "s" : ""),
+                  note: "Load growth uncertainty is high. A 1-year error shifts NPV materially. Deferral timing depends on load growth trajectory, coincident peak trends, and utility planning assumptions — all sourced from the utility's own IRP or capital plan. Present as a sensitivity range."
+                },
+                mods.capacity && {
+                  a: "Capacity ELCC = " + fmtPct(p.capacity_accreditation),
+                  note: "ELCC reflects the resource adequacy contribution of the flex load. PJM's published ELCC class accreditations for summer-peaking DR are typically 50–70%. Penalty exposure for non-performance is NOT in this revenue line — that's a separate risk overlay."
+                },
+              ].filter(Boolean).map((item, i) => (
                 <div key={i} style={{ borderBottom: "1px solid #0f1c2a", paddingBottom: 10, marginBottom: 10 }}>
                   <div style={{ fontSize: 11, color: "#e2e8f0", fontFamily: "monospace", marginBottom: 3 }}>{item.a}</div>
                   <div style={{ fontSize: 10, color: "#3d5068", lineHeight: 1.7 }}>{item.note}</div>
