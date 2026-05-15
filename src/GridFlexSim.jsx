@@ -116,8 +116,14 @@ const MARKET_PRESETS = {
     duration_hours: 2,
     bess_cost_kwh: 350,
     site_soft_cost: 50000,
-    // Contract structure
+    // Contract structure — NWA + BTM dual revenue
     gridflex_rate_pct: 0.60,
+    facility_demand_rate_kw_month: 0,
+    gridflex_btm_share_pct: 0.80,
+    facility_upfront_pct: 0,
+    service_fee_kw_yr: 25,
+    debt_rate_pct: 0.08,
+    debt_term_years: 10,
   },
 };
 
@@ -148,11 +154,18 @@ const DEFAULTS = {
   // Module 5 — Dispatch Timing (RTO/VI only — hidden for EMC)
   forecast_peak_hour: 15,
   window_hours: 2,
-  // Module 8 — Contract Structure
+  // Module 8 — Contract Structure (RTO/VI)
   contract_years: 5,
   gridflex_rate_pct: 0.70,
   facility_incentive_kw_yr: 50,
   mw_deferral_threshold: 100,
+  // Module 8 — EMC Dual-Revenue Contract
+  facility_demand_rate_kw_month: 0,  // $/kW-month on facility's EMC bill
+  gridflex_btm_share_pct: 0.80,      // GridFlex share of BTM demand savings
+  facility_upfront_pct: 0,           // % of gross capex facility contributes
+  service_fee_kw_yr: 25,             // $/kW-yr management/dispatch/M&V fee
+  debt_rate_pct: 0.08,               // annual interest rate on GridFlex-held debt
+  debt_term_years: 10,               // loan term (years)
   // Module overrides — per-session toggle state
   module_overrides: {},
 };
@@ -549,24 +562,81 @@ export default function GridFlexSim() {
     const optMW_kw = optimal.mw * 1000;
     const avoided_kw_yr = optimal.dollars_per_kw_yr;
     const gridflex_rate_kw_yr = avoided_kw_yr * p.gridflex_rate_pct;
-    const facility_kw_yr = p.facility_incentive_kw_yr;
-    const margin_kw_yr = gridflex_rate_kw_yr - facility_kw_yr;
-    const gridflex_annual = optMW_kw * gridflex_rate_kw_yr;
-    const facility_annual = optMW_kw * facility_kw_yr;
-    const margin_annual = gridflex_annual - facility_annual;
     const utility_net_kw_yr = avoided_kw_yr - gridflex_rate_kw_yr;
     const utility_net_annual = optMW_kw * utility_net_kw_yr;
     const rim_pass = gridflex_rate_kw_yr < avoided_kw_yr;
+    const nwa_annual = optMW_kw * gridflex_rate_kw_yr;
+
+    if (market === "emc") {
+      // ── BTM demand charge savings at the facility ──────────────────────────
+      const btm_savings_annual = optMW_kw * (p.delivery_factor || 0.95)
+        * (p.facility_demand_rate_kw_month || 0) * 12;
+      const gridflex_btm_revenue = btm_savings_annual * (p.gridflex_btm_share_pct || 0.80);
+      const facility_btm_savings = btm_savings_annual - gridflex_btm_revenue;
+
+      // ── Service / management fee ───────────────────────────────────────────
+      const service_fee_annual = optMW_kw * (p.service_fee_kw_yr || 0);
+
+      // ── Total GridFlex annual revenue ──────────────────────────────────────
+      const total_gf_revenue_annual = nwa_annual + gridflex_btm_revenue + service_fee_annual;
+
+      // ── Capital structure ──────────────────────────────────────────────────
+      const sites = Math.ceil(optimal.mw * 1000 / (p.site_kw || 500));
+      const siteKwh = (p.site_kw || 500) * (p.duration_hours || 2);
+      const site_cost = siteKwh * (p.bess_cost_kwh || 350) + (p.site_soft_cost || 50000);
+      const gross_capex = sites * site_cost;
+      const itc_credit = gross_capex * (p.itc_pct || 0.30);
+      const facility_upfront_amount = gross_capex * (p.facility_upfront_pct || 0);
+      const gridflex_net_capex = Math.max(0, gross_capex - itc_credit - facility_upfront_amount);
+
+      // ── Debt service (PMT formula) ─────────────────────────────────────────
+      const dr = p.debt_rate_pct || 0.08;
+      const dt = Math.max(1, p.debt_term_years || 10);
+      const annual_debt_service = gridflex_net_capex > 0
+        ? gridflex_net_capex * (dr * Math.pow(1 + dr, dt)) / (Math.pow(1 + dr, dt) - 1)
+        : 0;
+
+      // ── Net margin ─────────────────────────────────────────────────────────
+      const gf_net_margin_annual = total_gf_revenue_annual - annual_debt_service;
+
+      return {
+        // Utility / NWA
+        avoided_kw_yr, gridflex_rate_kw_yr, utility_net_kw_yr, utility_net_annual, nwa_annual, rim_pass,
+        // BTM
+        btm_savings_annual, gridflex_btm_revenue, facility_btm_savings,
+        // Service fee
+        service_fee_annual,
+        // Revenue total
+        total_gf_revenue_annual,
+        // Capital
+        gross_capex, itc_credit, facility_upfront_amount, gridflex_net_capex, sites,
+        // Debt
+        annual_debt_service,
+        // Net
+        gf_net_margin_annual,
+        total_contract: gf_net_margin_annual * p.contract_years,
+        // Facility view
+        facility_upfront_amount,
+        facility_annual_net: facility_btm_savings,
+      };
+    }
+
+    // ── RTO / VI original model ────────────────────────────────────────────
+    const facility_kw_yr = p.facility_incentive_kw_yr;
+    const margin_kw_yr = gridflex_rate_kw_yr - facility_kw_yr;
+    const gridflex_annual = nwa_annual;
+    const facility_annual = optMW_kw * facility_kw_yr;
+    const margin_annual = gridflex_annual - facility_annual;
     return {
       avoided_kw_yr, gridflex_rate_kw_yr, facility_kw_yr, margin_kw_yr,
       gridflex_annual, facility_annual, margin_annual,
-      utility_net_kw_yr, utility_net_annual, rim_pass,
+      utility_net_kw_yr, utility_net_annual, rim_pass, nwa_annual,
       total_3yr: margin_annual * 3,
       total_5yr: margin_annual * 5,
       total_10yr: margin_annual * 10,
       total_contract: margin_annual * p.contract_years,
     };
-  }, [optimal, p.gridflex_rate_pct, p.facility_incentive_kw_yr, p.contract_years]);
+  }, [optimal, p, market]);
 
   const confColor = r.reduction_fraction > 0.85 ? "#ef4444" : r.reduction_fraction > 0.6 ? "#f59e0b" : "#22c55e";
 
@@ -1336,7 +1406,7 @@ export default function GridFlexSim() {
                 </div>
                 <Slider label="BESS Hardware Cost" value={p.bess_cost_kwh || 350}
                   display={"$" + (p.bess_cost_kwh || 350) + "/kWh"}
-                  onChange={set("bess_cost_kwh")} min={150} max={500} step={10}
+                  onChange={set("bess_cost_kwh")} min={150} max={650} step={10}
                   note={"Site hardware: $" + (((p.site_kw || 500) * (p.duration_hours || 2) * (p.bess_cost_kwh || 350)) / 1000).toFixed(0) + "K — all-in installed (inverter, BMS, installation)"} />
                 <Slider label="Per-Site Soft Costs" value={(p.site_soft_cost || 50000) / 1000}
                   display={"$" + ((p.site_soft_cost || 50000) / 1000).toFixed(0) + "K/site"}
@@ -1385,13 +1455,46 @@ export default function GridFlexSim() {
           </Panel>
 
           {/* Module 8 — Contract Structure */}
-          <Panel title="Module 8 — Contract Structure" accent="#34d399" badge={{ text: "NWA CONTRACT", color: "#34d399" }}>
+          <Panel title="Module 8 — Contract Structure" accent="#34d399" badge={{ text: market === "emc" ? "DUAL REVENUE" : "NWA CONTRACT", color: "#34d399" }}>
             <Slider label="Contract Term" value={p.contract_years} display={p.contract_years + " yrs"}
-              onChange={set("contract_years")} min={3} max={10} step={1} note="NWA contract length — longer term justifies higher rate" />
-            <Slider label="GridFlex Rate (% of avoided cost)" value={p.gridflex_rate_pct} display={fmtPct(p.gridflex_rate_pct)}
-              onChange={set("gridflex_rate_pct")} min={0.40} max={0.85} step={0.05} note="Utility pays GridFlex this share — utility keeps the rest as net savings" />
-            <Slider label="Facility Incentive ($/kW-yr)" value={p.facility_incentive_kw_yr} display={"$" + p.facility_incentive_kw_yr + "/kW-yr"}
-              onChange={set("facility_incentive_kw_yr")} min={10} max={100} step={5} note="Monthly bill credit to facility — funded from GridFlex contract revenue" />
+              onChange={set("contract_years")} min={3} max={15} step={1} note="NWA contract length — longer term justifies higher rate and improves debt coverage" />
+            <Slider label="GridFlex NWA Rate (% of utility avoided cost)" value={p.gridflex_rate_pct} display={fmtPct(p.gridflex_rate_pct)}
+              onChange={set("gridflex_rate_pct")} min={0.40} max={0.85} step={0.05} note="Utility pays GridFlex this share of G&T avoidance — utility keeps the rest" />
+            {market === "emc" ? (
+              <>
+                <div style={{ fontSize: 9, color: "#34d399", fontFamily: "monospace", letterSpacing: "0.1em", margin: "10px 0 6px", borderTop: "1px solid #0f1c2a", paddingTop: 10 }}>BTM — FACILITY DEMAND CHARGE SAVINGS</div>
+                <Slider label="Facility Demand Charge Rate" value={p.facility_demand_rate_kw_month || 0}
+                  display={"$" + (p.facility_demand_rate_kw_month || 0).toFixed(2) + "/kW-mo"}
+                  onChange={set("facility_demand_rate_kw_month")} min={6} max={20} step={0.25}
+                  note="$/kW-month on facility's commercial EMC bill — enter from their rate schedule" />
+                <Slider label="GridFlex Share of BTM Savings" value={p.gridflex_btm_share_pct || 0.80}
+                  display={fmtPct(p.gridflex_btm_share_pct || 0.80)}
+                  onChange={set("gridflex_btm_share_pct")} min={0.20} max={0.80} step={0.05}
+                  note={"Facility keeps " + fmtPct(1 - (p.gridflex_btm_share_pct || 0.80)) + " of their demand savings — their ongoing incentive"} />
+                <div style={{ fontSize: 9, color: "#34d399", fontFamily: "monospace", letterSpacing: "0.1em", margin: "10px 0 6px", borderTop: "1px solid #0f1c2a", paddingTop: 10 }}>FACILITY UPFRONT CONTRIBUTION</div>
+                <Slider label="Facility Upfront (% of project cost)" value={p.facility_upfront_pct || 0}
+                  display={fmtPct(p.facility_upfront_pct || 0)}
+                  onChange={set("facility_upfront_pct")} min={0} max={0.50} step={0.05}
+                  note={"Facility puts in " + fmtD((contract?.gross_capex || 0) * (p.facility_upfront_pct || 0)) + " upfront → GridFlex net capex goes down → negotiate lower BTM share"} />
+                <div style={{ fontSize: 9, color: "#34d399", fontFamily: "monospace", letterSpacing: "0.1em", margin: "10px 0 6px", borderTop: "1px solid #0f1c2a", paddingTop: 10 }}>SERVICE FEE</div>
+                <Slider label="Management / Dispatch Fee" value={p.service_fee_kw_yr || 0}
+                  display={"$" + (p.service_fee_kw_yr || 0) + "/kW-yr"}
+                  onChange={set("service_fee_kw_yr")} min={0} max={100} step={5}
+                  note="Annual fee for DERMS dispatch, M&V, contract admin — paid by facility. $20–50/kW-yr typical for managed DERaaS" />
+                <div style={{ fontSize: 9, color: "#34d399", fontFamily: "monospace", letterSpacing: "0.1em", margin: "10px 0 6px", borderTop: "1px solid #0f1c2a", paddingTop: 10 }}>DEBT (GRIDFLEX-HELD)</div>
+                <Slider label="Interest Rate" value={p.debt_rate_pct || 0.08}
+                  display={fmtPct(p.debt_rate_pct || 0.08)}
+                  onChange={set("debt_rate_pct")} min={0.04} max={0.14} step={0.005}
+                  note="Commercial BESS financing: 6–10% typical with NWA offtake as collateral" />
+                <Slider label="Loan Term" value={p.debt_term_years || 10}
+                  display={(p.debt_term_years || 10) + " yrs"}
+                  onChange={set("debt_term_years")} min={5} max={15} step={1}
+                  note="Match to contract term or BESS useful life (10–15 yr)" />
+              </>
+            ) : (
+              <Slider label="Facility Incentive ($/kW-yr)" value={p.facility_incentive_kw_yr} display={"$" + p.facility_incentive_kw_yr + "/kW-yr"}
+                onChange={set("facility_incentive_kw_yr")} min={10} max={100} step={5} note="Monthly bill credit to facility — funded from GridFlex contract revenue" />
+            )}
           </Panel>
 
           {/* Module 9 — Operating Reserve Value */}
@@ -1903,15 +2006,133 @@ export default function GridFlexSim() {
             <>
               {!contract ? (
                 <Panel title="Contract Structure" accent="#34d399">
-                  <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace" }}>Run the model to see contract outputs.</div>
+                  <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace" }}>Enter CP rate and MW to see contract outputs.</div>
                 </Panel>
+              ) : market === "emc" ? (
+                <>
+                  {/* EMC dual-revenue contract view */}
+                  <Panel title="Revenue Stack — GridFlex Annual Income" accent="#34d399">
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 14 }}>
+                      {[
+                        { label: "NWA — Utility Payment", value: fmtD(contract.nwa_annual), sub: fmtPct(p.gridflex_rate_pct) + " of G&T avoided cost/yr", color: "#06b6d4" },
+                        { label: "BTM Savings Share", value: fmtD(contract.gridflex_btm_revenue), sub: fmtPct(p.gridflex_btm_share_pct || 0.80) + " of facility demand savings/yr", color: "#16a34a" },
+                        { label: "Service / Mgmt Fee", value: fmtD(contract.service_fee_annual), sub: "$" + (p.service_fee_kw_yr || 0) + "/kW-yr on " + (optimal?.mw || 0) + " MW enrolled", color: "#a78bfa" },
+                      ].map((m) => (
+                        <div key={m.label} style={{ background: "#050b12", border: "1px solid " + m.color + "33", borderLeft: "3px solid " + m.color, borderRadius: 6, padding: "12px 14px" }}>
+                          <div style={{ fontSize: 9, color: m.color, fontFamily: "monospace", letterSpacing: "0.1em", marginBottom: 4 }}>{m.label}</div>
+                          <div style={{ fontSize: 18, fontWeight: 700, color: "#e2e8f0", fontFamily: "monospace" }}>{m.value}</div>
+                          <div style={{ fontSize: 10, color: "#3d5068", marginTop: 3 }}>{m.sub}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ background: "#34d39910", border: "1px solid #34d39930", borderRadius: 5, padding: "10px 12px", fontSize: 11, fontFamily: "monospace" }}>
+                      <span style={{ color: "#3d5068" }}>Total GridFlex annual revenue: </span>
+                      <span style={{ color: "#34d399", fontWeight: 700, fontSize: 14 }}>{fmtD(contract.total_gf_revenue_annual)}</span>
+                      <span style={{ color: "#3d5068" }}> = NWA {fmtD(contract.nwa_annual)} + BTM {fmtD(contract.gridflex_btm_revenue)} + Fees {fmtD(contract.service_fee_annual)}</span>
+                    </div>
+                  </Panel>
+
+                  <Panel title="Capital Structure — GridFlex Balance Sheet" accent="#f59e0b">
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 12 }}>
+                      {[
+                        { label: "Gross BESS Capex", value: fmtD(contract.gross_capex), sub: contract.sites + " sites × $" + fmtD(Math.round(contract.gross_capex / contract.sites)) + "/site", color: "#ef4444" },
+                        { label: "ITC Credit (" + fmtPct(p.itc_pct || 0.30) + ")", value: "–" + fmtD(contract.itc_credit), sub: "48E — reduces GridFlex net capex", color: "#22c55e" },
+                        { label: "Facility Upfront (" + fmtPct(p.facility_upfront_pct || 0) + ")", value: "–" + fmtD(contract.facility_upfront_amount), sub: "facility contribution → lower BTM share", color: "#06b6d4" },
+                        { label: "GridFlex Net Capex", value: fmtD(contract.gridflex_net_capex), sub: "amount GridFlex finances at " + fmtPct(p.debt_rate_pct || 0.08), color: "#f59e0b" },
+                      ].map((m) => (
+                        <div key={m.label} style={{ background: "#050b12", border: "1px solid " + m.color + "33", borderLeft: "3px solid " + m.color, borderRadius: 6, padding: "11px 13px" }}>
+                          <div style={{ fontSize: 9, color: m.color, fontFamily: "monospace", letterSpacing: "0.1em", marginBottom: 4 }}>{m.label}</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: "#e2e8f0", fontFamily: "monospace" }}>{m.value}</div>
+                          <div style={{ fontSize: 10, color: "#3d5068", marginTop: 3 }}>{m.sub}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ background: "#ef444410", border: "1px solid #ef444430", borderRadius: 5, padding: "9px 12px", fontSize: 11, fontFamily: "monospace" }}>
+                      <span style={{ color: "#3d5068" }}>Annual debt service ({fmtPct(p.debt_rate_pct || 0.08)}, {p.debt_term_years || 10} yr): </span>
+                      <span style={{ color: "#ef4444", fontWeight: 700 }}>{fmtD(contract.annual_debt_service)}/yr</span>
+                    </div>
+                  </Panel>
+
+                  <Panel title={"GridFlex Net Margin — At Optimal " + optimal?.mw + " MW"} accent="#a78bfa">
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+                      {[
+                        { label: "Total Revenue", value: fmtD(contract.total_gf_revenue_annual), sub: "NWA + BTM share + fees", color: "#34d399" },
+                        { label: "Annual Debt Service", value: "–" + fmtD(contract.annual_debt_service), sub: fmtPct(p.debt_rate_pct || 0.08) + " × " + (p.debt_term_years || 10) + "yr on " + fmtD(contract.gridflex_net_capex), color: "#ef4444" },
+                        { label: "GridFlex Net Margin", value: fmtD(contract.gf_net_margin_annual), sub: contract.gf_net_margin_annual >= 0 ? "annual after debt service" : "⚠ negative — adjust terms", color: contract.gf_net_margin_annual >= 0 ? "#a78bfa" : "#ef4444" },
+                      ].map((m) => (
+                        <div key={m.label} style={{ background: "#050b12", border: "1px solid " + m.color + "33", borderLeft: "3px solid " + m.color, borderRadius: 6, padding: "12px 14px" }}>
+                          <div style={{ fontSize: 9, color: m.color, fontFamily: "monospace", letterSpacing: "0.1em", marginBottom: 4 }}>{m.label}</div>
+                          <div style={{ fontSize: 18, fontWeight: 700, color: "#e2e8f0", fontFamily: "monospace" }}>{m.value}</div>
+                          <div style={{ fontSize: 10, color: "#3d5068", marginTop: 3 }}>{m.sub}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ fontSize: 10, color: "#3d5068", fontFamily: "monospace", marginBottom: 8 }}>CONTRACT TERM COMPARISON</div>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "monospace" }}>
+                      <thead>
+                        <tr>{["Term", "Total Revenue/yr", "Debt Service/yr", "Net Margin/yr", "Cumulative Net"].map(h => (
+                          <th key={h} style={{ textAlign: h === "Term" ? "left" : "right", fontSize: 9, color: "#3d5068", padding: "5px 8px", borderBottom: "1px solid #0f1c2a" }}>{h}</th>
+                        ))}</tr>
+                      </thead>
+                      <tbody>
+                        {[3, 5, 10, 15].map(yrs => {
+                          const isActive = yrs === p.contract_years;
+                          return (
+                            <tr key={yrs} style={{ background: isActive ? "#a78bfa10" : "transparent", borderBottom: "1px solid #0a1520" }}>
+                              <td style={{ padding: "6px 8px", color: isActive ? "#a78bfa" : "#7a90a8", fontWeight: isActive ? 700 : 400 }}>{yrs} yr{isActive ? " ◀" : ""}</td>
+                              <td style={{ padding: "6px 8px", textAlign: "right", color: "#34d399" }}>{fmtD(contract.total_gf_revenue_annual)}</td>
+                              <td style={{ padding: "6px 8px", textAlign: "right", color: "#ef4444" }}>–{fmtD(contract.annual_debt_service)}</td>
+                              <td style={{ padding: "6px 8px", textAlign: "right", color: contract.gf_net_margin_annual >= 0 ? "#a78bfa" : "#ef4444" }}>{fmtD(contract.gf_net_margin_annual)}</td>
+                              <td style={{ padding: "6px 8px", textAlign: "right", color: "#f59e0b", fontWeight: 700 }}>{fmtD(contract.gf_net_margin_annual * yrs)}</td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </Panel>
+
+                  <Panel title="Facility Economics — What the Building Owner Sees" accent="#16a34a">
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+                      {[
+                        { label: "Upfront Contribution", value: fmtD(contract.facility_upfront_amount), sub: fmtPct(p.facility_upfront_pct || 0) + " of " + fmtD(contract.gross_capex) + " project cost", color: "#ef4444" },
+                        { label: "Annual BTM Savings", value: fmtD(contract.facility_btm_savings), sub: fmtPct(1 - (p.gridflex_btm_share_pct || 0.80)) + " of demand charge reduction", color: "#16a34a" },
+                        { label: "Service Fee Paid", value: "–" + fmtD(contract.service_fee_annual), sub: "$" + (p.service_fee_kw_yr || 0) + "/kW-yr to GridFlex", color: "#3d5068" },
+                      ].map((m) => (
+                        <div key={m.label} style={{ background: "#050b12", border: "1px solid " + m.color + "33", borderLeft: "3px solid " + m.color, borderRadius: 6, padding: "12px 14px" }}>
+                          <div style={{ fontSize: 9, color: m.color, fontFamily: "monospace", letterSpacing: "0.1em", marginBottom: 4 }}>{m.label}</div>
+                          <div style={{ fontSize: 16, fontWeight: 700, color: "#e2e8f0", fontFamily: "monospace" }}>{m.value}</div>
+                          <div style={{ fontSize: 10, color: "#3d5068", marginTop: 3 }}>{m.sub}</div>
+                        </div>
+                      ))}
+                    </div>
+                    <div style={{ background: "#16a34a10", border: "1px solid #16a34a30", borderRadius: 5, padding: "9px 12px", fontSize: 11, fontFamily: "monospace" }}>
+                      <div style={{ color: "#3d5068", marginBottom: 3 }}>Full demand charge savings generated: <span style={{ color: "#e2e8f0", fontWeight: 700 }}>{fmtD(contract.btm_savings_annual)}/yr</span></div>
+                      <div style={{ color: "#3d5068" }}>Facility keeps <span style={{ color: "#16a34a", fontWeight: 700 }}>{fmtD(contract.facility_btm_savings)}/yr</span> — GridFlex keeps <span style={{ color: "#34d399", fontWeight: 700 }}>{fmtD(contract.gridflex_btm_revenue)}/yr</span></div>
+                    </div>
+                  </Panel>
+
+                  <Panel title="Payment Flow — How the Money Moves" accent="#34d399">
+                    <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace", lineHeight: 2 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+                        <div style={{ background: "#06b6d420", border: "1px solid #06b6d440", borderRadius: 4, padding: "4px 10px", color: "#06b6d4", fontSize: 10, fontWeight: 700 }}>EMC</div>
+                        <div style={{ color: "#34d399", fontSize: 10 }}>── NWA {fmtD(contract.nwa_annual)}/yr ──▶</div>
+                        <div style={{ background: "#34d39920", border: "1px solid #34d39940", borderRadius: 4, padding: "4px 10px", color: "#34d399", fontSize: 10, fontWeight: 700 }}>GRIDFLEX</div>
+                        <div style={{ color: "#16a34a", fontSize: 10 }}>◀── BTM {fmtD(contract.gridflex_btm_revenue)}/yr + Fee {fmtD(contract.service_fee_annual)}/yr ──</div>
+                        <div style={{ background: "#16a34a20", border: "1px solid #16a34a40", borderRadius: 4, padding: "4px 10px", color: "#16a34a", fontSize: 10, fontWeight: 700 }}>FACILITIES</div>
+                      </div>
+                      <div style={{ fontSize: 10, color: "#3d5068", lineHeight: 1.8, borderTop: "1px solid #0f1c2a", paddingTop: 8 }}>
+                        <div>• EMC pays GridFlex for G&T demand savings it actually realizes — no upfront program cost.</div>
+                        <div>• Facilities pay GridFlex a service fee and share BTM savings; receive the BESS at no upfront hardware cost (unless contributing equity).</div>
+                        <div>• GridFlex nets {fmtD(contract.gf_net_margin_annual)}/yr after debt service — {fmtD(contract.total_contract)} over the {p.contract_years}-yr term.</div>
+                        <div>• EMC retains {fmtD(contract.utility_net_annual)}/yr in net G&T savings vs. absorbing full demand charge drag.</div>
+                      </div>
+                    </div>
+                  </Panel>
+                </>
               ) : (
                 <>
+                  {/* RTO / VI original contract view */}
                   <Panel title="NWA Contract — Rate Structure" accent="#34d399">
-                    <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace", lineHeight: 1.8, marginBottom: 14 }}>
-                      GridFlex holds a single NWA contract with the utility, priced as a share of the utility's own avoided cost.
-                      The utility deals with one contract and one invoice. GridFlex handles facility incentive payments downstream.
-                    </div>
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 14 }}>
                       {[
                         { label: "Utility Avoided Cost", value: "$" + Math.round(contract.avoided_kw_yr) + "/kW-yr", sub: "production cost delta at optimal MW", color: "#06b6d4" },
@@ -1925,29 +2146,8 @@ export default function GridFlexSim() {
                         </div>
                       ))}
                     </div>
-                    <div style={{ background: "#0a1118", border: "1px solid #1e4a30", borderRadius: 6, padding: "14px 16px", marginTop: 4 }}>
-                      <div style={{ fontSize: 9, color: "#4ade80", fontFamily: "monospace", letterSpacing: "0.12em", fontWeight: 700, marginBottom: 8 }}>RIM TEST — RATEPAYER IMPACT MEASURE</div>
-                      <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace", lineHeight: 1.9 }}>
-                        <div style={{ marginBottom: 8 }}>
-                          The RIM test asks whether non-participating ratepayers see their rates increase as a result of the program.
-                          This is the hardest test for generic DR — but GridFlex is structured differently.
-                        </div>
-                        <div style={{ borderLeft: "2px solid #4ade8040", paddingLeft: 10, marginBottom: 8 }}>
-                          <div style={{ color: "#4ade80", fontWeight: 700, marginBottom: 4 }}>Why GridFlex passes the RIM argument:</div>
-                          <div>• Constraint relief on a binding corridor reduces system-wide production costs — not just for enrolled buildings</div>
-                          <div>• Every ratepayer on this corridor was already paying the ${Math.round(contract.avoided_kw_yr)}/kW-yr drag through higher dispatch costs</div>
-                          <div>• GridFlex at ${Math.round(contract.gridflex_rate_kw_yr)}/kW-yr captures {fmtPct(p.gridflex_rate_pct)} of savings — the remaining {fmtPct(1 - p.gridflex_rate_pct)} flows back to all ratepayers as lower production costs</div>
-                          <div>• Unlike generic DSM (which reduces utility revenue without broad system benefits), topology-targeted constraint relief benefits the full corridor</div>
-                        </div>
-                        <div style={{ color: "#94a3b8", fontSize: 10 }}>
-                          <span style={{ color: "#f59e0b", fontWeight: 700 }}>NOTE: </span>
-                          Georgia Power and the Georgia PSC actively scrutinize the RIM test. Address this framing explicitly in any utility presentation. Georgia does not yet have a formalized NWA framework — first-mover opportunity to help define it.
-                        </div>
-                      </div>
-                    </div>
                   </Panel>
-
-                  <Panel title={"GridFlex Economics — At Optimal " + optimal.mw + " MW"} accent="#34d399">
+                  <Panel title={"GridFlex Economics — At Optimal " + optimal?.mw + " MW"} accent="#34d399">
                     <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 14 }}>
                       {[
                         { label: "Gross Contract Revenue", value: fmtD(contract.gridflex_annual), sub: "annual — paid by utility", color: "#34d399" },
@@ -1962,48 +2162,23 @@ export default function GridFlexSim() {
                         </div>
                       ))}
                     </div>
-
-                    <div style={{ fontSize: 10, color: "#3d5068", fontFamily: "monospace", marginBottom: 10 }}>CONTRACT TERM COMPARISON</div>
                     <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "monospace" }}>
-                      <thead>
-                        <tr>
-                          {["Term", "GridFlex Gross/yr", "Facility Out/yr", "GridFlex Margin/yr", "Total Contract Value"].map(h => (
-                            <th key={h} style={{ textAlign: h === "Term" ? "left" : "right", fontSize: 9, color: "#3d5068", letterSpacing: "0.1em", padding: "6px 10px", borderBottom: "1px solid #0f1c2a" }}>{h}</th>
-                          ))}
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {[3, 5, 10].map(yrs => {
-                          const isActive = yrs === p.contract_years;
-                          return (
-                            <tr key={yrs} style={{ background: isActive ? "#34d39910" : "transparent" }}>
-                              <td style={{ padding: "8px 10px", color: isActive ? "#34d399" : "#7a90a8", fontWeight: isActive ? 700 : 400 }}>{yrs} years{isActive ? " ◀" : ""}</td>
-                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#e2e8f0" }}>{fmtD(contract.gridflex_annual)}</td>
-                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#f472b6" }}>{fmtD(contract.facility_annual)}</td>
-                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#a78bfa" }}>{fmtD(contract.margin_annual)}</td>
-                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#f59e0b", fontWeight: 700 }}>{fmtD(contract.margin_annual * yrs)}</td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
+                      <thead><tr>{["Term", "GF Gross/yr", "Facility Out/yr", "GF Margin/yr", "Cumulative"].map(h => (
+                        <th key={h} style={{ textAlign: h === "Term" ? "left" : "right", fontSize: 9, color: "#3d5068", padding: "5px 8px", borderBottom: "1px solid #0f1c2a" }}>{h}</th>
+                      ))}</tr></thead>
+                      <tbody>{[3, 5, 10].map(yrs => {
+                        const isActive = yrs === p.contract_years;
+                        return (
+                          <tr key={yrs} style={{ background: isActive ? "#34d39910" : "transparent", borderBottom: "1px solid #0a1520" }}>
+                            <td style={{ padding: "6px 8px", color: isActive ? "#34d399" : "#7a90a8", fontWeight: isActive ? 700 : 400 }}>{yrs} yr{isActive ? " ◀" : ""}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right", color: "#e2e8f0" }}>{fmtD(contract.gridflex_annual)}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right", color: "#f472b6" }}>{fmtD(contract.facility_annual)}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right", color: "#a78bfa" }}>{fmtD(contract.margin_annual)}</td>
+                            <td style={{ padding: "6px 8px", textAlign: "right", color: "#f59e0b", fontWeight: 700 }}>{fmtD(contract.margin_annual * yrs)}</td>
+                          </tr>
+                        );
+                      })}</tbody>
                     </table>
-                  </Panel>
-
-                  <Panel title="Payment Flow — How the Money Moves" accent="#34d399">
-                    <div style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace", lineHeight: 2 }}>
-                      <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 8 }}>
-                        <div style={{ background: "#06b6d420", border: "1px solid #06b6d440", borderRadius: 4, padding: "4px 10px", color: "#06b6d4", fontSize: 10, fontWeight: 700 }}>UTILITY</div>
-                        <div style={{ color: "#34d399" }}>──── pays {fmtD(contract.gridflex_annual)}/yr ────▶</div>
-                        <div style={{ background: "#34d39920", border: "1px solid #34d39940", borderRadius: 4, padding: "4px 10px", color: "#34d399", fontSize: 10, fontWeight: 700 }}>GRIDFLEX</div>
-                        <div style={{ color: "#f472b6" }}>──── pays {fmtD(contract.facility_annual)}/yr ────▶</div>
-                        <div style={{ background: "#f472b620", border: "1px solid #f472b640", borderRadius: 4, padding: "4px 10px", color: "#f472b6", fontSize: 10, fontWeight: 700 }}>FACILITIES</div>
-                      </div>
-                      <div style={{ fontSize: 10, color: "#3d5068", lineHeight: 1.8 }}>
-                        Utility retains {fmtD(contract.utility_net_annual)}/yr in net savings vs. building the wire.
-                        Facility bill credit offsets their Blue Frontier monthly payment.
-                        GridFlex keeps {fmtD(contract.margin_annual)}/yr — {fmtD(contract.total_contract)} over the {p.contract_years}-year term.
-                      </div>
-                    </div>
                   </Panel>
                 </>
               )}
