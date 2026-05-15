@@ -55,28 +55,27 @@ const MARKET_MODULES = {
 // configuration for that utility class without manual slider tuning.
 const MARKET_PRESETS = {
   rto: {
-    // Redispatch-driven framing — typical PJM/MISO thermal-constraint case.
-    h_bind: 320, mw_redisp: 100, price_diff: 55,
-    mwh_curt: 45000, curt_attrib: 0.35, curt_mwh_value: 48,
+    // Redispatch — enter utility constraint data to unlock value
+    h_bind: 0, mw_redisp: 0, price_diff: 0,
+    mwh_curt: 0, curt_attrib: 0.0, curt_mwh_value: 0,
     // Topology leverage — PTDF-driven, transmission-grid concept
     topology_leverage: 5,
-    // Capacity market (PJM BRA ~$200/MW-day, MISO PRA ~$80/MW-day; ~$180 avg reasonable)
-    capacity_price_mw_day: 180, capacity_accreditation: 0.60,
-    // CP avoidance — not applicable
+    // Capacity market — enter clearing price + accreditation when known
+    capacity_price_mw_day: 0, capacity_accreditation: 0.0,
+    // CP avoidance — not applicable in RTO
     cp_charge_kw_month: 0, trans_charge_kw_month: 0,
     cp_events_per_year: 12, cp_coincidence: 0.0,
-    // Energy arbitrage — LMP spread between peak & off-peak
-    arb_spread_mwh: 40, arb_hours_per_year: 500,
-    // Reserves
-    reserve_eligible_pct: 0.80, reserve_rate_kw_yr: 8,
-    // Capital deferral — MW threshold = MW of redispatch the project would
-    // have absorbed. Realization scales with constraint relief.
+    // Energy arbitrage — enter LMP spread when known
+    arb_spread_mwh: 0, arb_hours_per_year: 0,
+    // Reserves — enter eligible fraction + rate when known
+    reserve_eligible_pct: 0.0, reserve_rate_kw_yr: 0,
+    // Capital deferral — structural inputs; realization scales with constraint relief
     capex: 28000000, wacc: 0.075, years_deferral: 3,
     mw_deferral_threshold: 100,
   },
   vi: {
-    // Internal redispatch within a balancing authority — smaller MW of out-of-merit
-    h_bind: 250, mw_redisp: 60, price_diff: 35,
+    // Internal redispatch — enter utility constraint data to unlock value
+    h_bind: 0, mw_redisp: 0, price_diff: 0,
     mwh_curt: 0, curt_attrib: 0.0, curt_mwh_value: 0,
     topology_leverage: 4,
     // No capacity market
@@ -85,33 +84,28 @@ const MARKET_PRESETS = {
     cp_events_per_year: 12, cp_coincidence: 0.0,
     // No hourly market to arb against
     arb_spread_mwh: 0, arb_hours_per_year: 0,
-    // Reserves still valued via IRP reserve margin
-    reserve_eligible_pct: 0.80, reserve_rate_kw_yr: 6,
+    // Reserves — enter eligible fraction + rate when known
+    reserve_eligible_pct: 0.0, reserve_rate_kw_yr: 0,
     // Capital deferral — VI utilities have the largest projects
     capex: 50000000, wacc: 0.075, years_deferral: 4,
     mw_deferral_threshold: 60,
   },
   emc: {
-    // EMC does not "redispatch" — these values are leftovers for sim compat
-    h_bind: 50, mw_redisp: 0, price_diff: 0,
+    // EMC does not "redispatch" — CP avoidance is the headline value stream
+    h_bind: 0, mw_redisp: 0, price_diff: 0,
     mwh_curt: 0, curt_attrib: 0.0, curt_mwh_value: 0,
-    // Topology leverage = 1: distribution coops are at the load end of the
-    // grid; no PTDF leverage applies. Value comes from CP coincidence, not
-    // network topology.
+    // Topology leverage = 1: distribution coops have no PTDF leverage
     topology_leverage: 1,
     capacity_price_mw_day: 0, capacity_accreditation: 0.0,
-    // CP avoidance — HEADLINE value stream for cooperatives.
-    // $5/kW-month G&T demand charge + $3/kW-month NITS ≈ $8/kW-month total CP impact.
-    cp_charge_kw_month: 5.0, trans_charge_kw_month: 3.0,
-    cp_events_per_year: 12, cp_coincidence: 0.80,
-    // Wholesale purchase arbitrage — peak vs off-peak wholesale $/MWh spread
-    arb_spread_mwh: 20, arb_hours_per_year: 400,
+    // CP avoidance — enter G&T demand charge + NITS + coincidence when known
+    cp_charge_kw_month: 0.0, trans_charge_kw_month: 0.0,
+    cp_events_per_year: 12, cp_coincidence: 0.0,
+    // Wholesale purchase arbitrage — enter spread + hours when known
+    arb_spread_mwh: 0, arb_hours_per_year: 0,
     // No reserves at distribution coop level
     reserve_eligible_pct: 0.0, reserve_rate_kw_yr: 0,
     // Capital deferral (distribution substations / feeders)
     capex: 12000000, wacc: 0.055, years_deferral: 3,
-    // For EMC, deferral threshold is the MW of CP-coincident peak load
-    // reduction needed to push out a distribution upgrade.
     mw_deferral_threshold: 15,
   },
 };
@@ -120,7 +114,7 @@ const MARKET_PRESETS = {
 
 const DEFAULTS = {
   // Market-type + preset-driven value-stack fields (all markets seed these;
-  // some zero out depending on market)
+  // value-driving params start at 0 so outputs show $0 until user enters data)
   ...MARKET_PRESETS.rto,
   // Module 3 — Topology Leverage
   topology_leverage: 5,
