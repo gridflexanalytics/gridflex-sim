@@ -97,16 +97,27 @@ const MARKET_PRESETS = {
     // Topology leverage = 1: distribution coops have no PTDF leverage
     topology_leverage: 1,
     capacity_price_mw_day: 0, capacity_accreditation: 0.0,
-    // CP avoidance — enter G&T demand charge + NITS + coincidence when known
+    // CP avoidance — enter from G&T wholesale rate schedule when known
+    // Southeast reference: OPC G&T demand ~$5-6/kW-mo, GTC NITS ~$2-4/kW-mo
     cp_charge_kw_month: 0.0, trans_charge_kw_month: 0.0,
     cp_events_per_year: 12, cp_coincidence: 0.0,
-    // Wholesale purchase arbitrage — enter spread + hours when known
+    // Wholesale purchase arbitrage — toggleable, off by default for EMC
     arb_spread_mwh: 0, arb_hours_per_year: 0,
     // No reserves at distribution coop level
     reserve_eligible_pct: 0.0, reserve_rate_kw_yr: 0,
-    // Capital deferral (distribution substations / feeders)
-    capex: 12000000, wacc: 0.055, years_deferral: 3,
-    mw_deferral_threshold: 15,
+    // Capital deferral (distribution substations / feeders) — toggleable
+    capex: 20000000, wacc: 0.055, years_deferral: 5,
+    // MW of CP-coincident peak reduction needed to push out the upgrade
+    mw_deferral_threshold: 5,
+    // BESS is high-reliability once commissioned
+    delivery_factor: 0.95,
+    // EMC BESS site sizing
+    site_kw: 500,
+    duration_hours: 2,
+    bess_cost_kwh: 350,
+    site_soft_cost: 50000,
+    // Contract structure
+    gridflex_rate_pct: 0.60,
   },
 };
 
@@ -123,30 +134,34 @@ const DEFAULTS = {
   delivery_factor: 0.70,
   coincidence_factor: 0.80,
   curt_mitigation: 0.45,
-  // Module 7 — Building Incentive
-  hvac_unit_cost: 45000,
-  hvac_unit_kw: 15,
-  itc_pct: 0.35,
+  // Module 7 — Flex Load / BESS Site Incentive
+  hvac_unit_cost: 45000,  // RTO/VI: cost per flex load unit
+  hvac_unit_kw: 15,       // RTO/VI: kW per unit
+  site_kw: 500,           // EMC: kW capacity per enrolled BESS site
+  duration_hours: 2,      // EMC: storage duration (2h or 4h)
+  bess_cost_kwh: 350,     // EMC: $/kWh installed hardware
+  site_soft_cost: 50000,  // EMC: flat per-site soft costs (permitting, engineering)
+  itc_pct: 0.30,
   utility_incentive_pct: 0.20,
   // Optimal MW threshold
   threshold_pct: 20,
-  // Module 5 — Dispatch Timing
+  // Module 5 — Dispatch Timing (RTO/VI only — hidden for EMC)
   forecast_peak_hour: 15,
   window_hours: 2,
   // Module 8 — Contract Structure
   contract_years: 5,
   gridflex_rate_pct: 0.70,
   facility_incentive_kw_yr: 50,
-  // Capital deferral — MW threshold at which the avoided/deferred infrastructure
-  // project is considered "moved out" by N years. Realization scales linearly
-  // with deployment up to this threshold. Pulled from market preset.
   mw_deferral_threshold: 100,
+  // Module overrides — per-session toggle state
+  module_overrides: {},
 };
 
 // ── Model ─────────────────────────────────────────────────────────────────────
 
 function runModel(p) {
-  const mods = MARKET_MODULES[p.market || "rto"] || MARKET_MODULES.rto;
+  const baseMods = MARKET_MODULES[p.market || "rto"] || MARKET_MODULES.rto;
+  const mods = p.module_overrides ? { ...baseMods, ...p.module_overrides } : baseMods;
 
   // ── Dependable MW + leverage (constraint relief framing) ────────────────
   // mw_effective = MW available *during* binding hours.
@@ -365,16 +380,25 @@ function buildLeverageComparison(p) {
 // ── Incentive ─────────────────────────────────────────────────────────────────
 
 function computeIncentiveData(p, sweep) {
+  const isEmc = p.market === "emc";
   return sweep.map((s) => {
-    const units = p.hvac_unit_kw > 0 ? Math.max(1, Math.ceil((s.mw * 1000) / p.hvac_unit_kw)) : 1;
-    const gross = units * p.hvac_unit_cost;
-    const itc = gross * p.itc_pct;
-    const rebate = gross * p.utility_incentive_pct;
-    const net = gross - itc - rebate;
-    // Use addressable revenue × term — works across all market types
-    // (RTO production cost delta + capacity, VI production cost delta,
-    // EMC CP avoidance + arbitrage). Production cost delta alone is $0
-    // for EMC, which would zero the value pool incorrectly.
+    let units, gross, itc, rebate, net;
+    if (isEmc) {
+      const siteKw = p.site_kw || 500;
+      const siteKwh = siteKw * (p.duration_hours || 2);
+      const siteCost = siteKwh * (p.bess_cost_kwh || 350) + (p.site_soft_cost || 50000);
+      units = siteKw > 0 ? Math.max(1, Math.ceil((s.mw * 1000) / siteKw)) : 1;
+      gross = units * siteCost;
+      itc = gross * (p.itc_pct || 0);
+      rebate = 0;
+      net = gross - itc;
+    } else {
+      units = p.hvac_unit_kw > 0 ? Math.max(1, Math.ceil((s.mw * 1000) / p.hvac_unit_kw)) : 1;
+      gross = units * p.hvac_unit_cost;
+      itc = gross * p.itc_pct;
+      rebate = gross * p.utility_incentive_pct;
+      net = gross - itc - rebate;
+    }
     const pool = s.addressable_annual * p.contract_years;
     return { mw: s.mw, units, gross, itc, rebate, net, pool };
   });
@@ -401,14 +425,26 @@ function fmtHour(h) {
 
 // ── UI Components ─────────────────────────────────────────────────────────────
 
-function Panel({ title, accent, children, badge }) {
+function Panel({ title, accent, children, badge, toggleable, enabled, onToggle }) {
+  const isOff = toggleable && enabled === false;
   return (
-    <div style={{ background: "#0b1520", border: "1px solid #0f1c2a", borderTop: "2px solid " + (accent || "#1e3a5a"), borderRadius: 8, padding: "16px 18px", marginBottom: 16 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, paddingBottom: 10, borderBottom: "1px solid #0f1c2a" }}>
-        <div style={{ fontSize: 10, fontFamily: "monospace", letterSpacing: "0.12em", color: accent || "#3b82f6", textTransform: "uppercase" }}>{title}</div>
-        {badge && <div style={{ fontSize: 9, fontFamily: "monospace", color: badge.color, background: badge.color + "18", border: "1px solid " + badge.color + "44", borderRadius: 3, padding: "2px 7px" }}>{badge.text}</div>}
+    <div style={{ background: "#0b1520", border: "1px solid #0f1c2a", borderTop: "2px solid " + (isOff ? "#1e3a5a" : (accent || "#1e3a5a")), borderRadius: 8, padding: "16px 18px", marginBottom: 16, opacity: isOff ? 0.45 : 1 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: isOff ? 0 : 12, paddingBottom: isOff ? 0 : 10, borderBottom: isOff ? "none" : "1px solid #0f1c2a" }}>
+        <div style={{ fontSize: 10, fontFamily: "monospace", letterSpacing: "0.12em", color: isOff ? "#2d4a63" : (accent || "#3b82f6"), textTransform: "uppercase" }}>{title}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 7 }}>
+          {badge && !isOff && <div style={{ fontSize: 9, fontFamily: "monospace", color: badge.color, background: badge.color + "18", border: "1px solid " + badge.color + "44", borderRadius: 3, padding: "2px 7px" }}>{badge.text}</div>}
+          {toggleable && (
+            <button onClick={onToggle} style={{
+              fontSize: 9, fontFamily: "monospace", fontWeight: 700, letterSpacing: "0.1em",
+              background: isOff ? "#0a111a" : (accent || "#3b82f6") + "25",
+              border: "1px solid " + (isOff ? "#1e3a5a" : (accent || "#3b82f6") + "55"),
+              color: isOff ? "#3d5068" : (accent || "#3b82f6"),
+              borderRadius: 3, padding: "3px 9px", cursor: "pointer",
+            }}>{isOff ? "OFF" : "ON"}</button>
+          )}
+        </div>
       </div>
-      {children}
+      {!isOff && children}
     </div>
   );
 }
@@ -477,11 +513,16 @@ export default function GridFlexSim() {
   // the user toggle between pitches without losing their flex-load config.
   const setMarket = (m) => {
     setMarketRaw(m);
-    setP((prev) => ({ ...prev, ...MARKET_PRESETS[m], market: m }));
+    setP((prev) => ({ ...prev, ...MARKET_PRESETS[m], market: m, module_overrides: {} }));
     const allowedTabs = MARKET_MODULES[m].tabs;
     if (!allowedTabs.includes(tab)) setTab(allowedTabs[0]);
   };
-  const mods = MARKET_MODULES[market] || MARKET_MODULES.rto;
+  const baseMods = MARKET_MODULES[market] || MARKET_MODULES.rto;
+  const mods = p.module_overrides ? { ...baseMods, ...p.module_overrides } : baseMods;
+  const toggleModule = (key) => setP((prev) => ({
+    ...prev,
+    module_overrides: { ...(prev.module_overrides || {}), [key]: !mods[key] },
+  }));
   const marketMeta = MARKET_TYPES[market] || MARKET_TYPES.rto;
 
   const r = useMemo(() => runModel(p), [p]);
@@ -685,14 +726,15 @@ export default function GridFlexSim() {
     </div>
   </div>
 
-  <div class="title">Constraint Relief via Topology-Targeted Flex Load</div>
+  <div class="title">${market === "emc" ? "Flex Before You Build — Coincident-Peak Load Reduction" : "Constraint Relief via Topology-Targeted Flex Load"}</div>
   <div class="subtitle">${marketLabel} &mdash; ${marketSubtitle}</div>
 
   <div class="highlight-box">
     <div class="hl-label">The Core Concept</div>
     <div class="hl-text">
-      At the right node on the network, 1 MW of flexible load shed can relieve <strong>${p.topology_leverage}x</strong> more redispatch than it would at an untargeted location — because of its Power Transfer Distribution Factor (PTDF) relative to the binding constraint.
-      GridFlex identifies these nodes, quantifies the production cost delta, and structures the engagement so the utility's own avoided costs fund the program.
+      ${market === "emc"
+        ? `Your cooperative is billed by the G&T on a <strong>coincident-peak (CP) determinant</strong> — a handful of hours each year that set your demand charge for the next 12 months. Every kilowatt your members draw during those hours is costing you on <em>both</em> the G&T demand charge and the transmission service charge. GridFlex deploys enrolled commercial BESS sites to reduce load precisely during those hours — then structures the engagement so the cooperative's own avoided G&T costs fund the program. <strong>Flex before you build.</strong>`
+        : `At the right node on the network, 1 MW of flexible load shed can relieve <strong>${p.topology_leverage}x</strong> more redispatch than it would at an untargeted location — because of its Power Transfer Distribution Factor (PTDF) relative to the binding constraint. GridFlex identifies these nodes, quantifies the production cost delta, and structures the engagement so the utility's own avoided costs fund the program.`}
     </div>
   </div>
 
@@ -707,8 +749,25 @@ export default function GridFlexSim() {
   </div>
 
   <div class="section">
-    <div class="section-head">The GridFlex Approach — Topology Leverage</div>
+    <div class="section-head">${market === "emc" ? "The GridFlex Approach — Enrolled BESS Fleet" : "The GridFlex Approach — Topology Leverage"}</div>
     <div class="grid3">
+      ${market === "emc" ? `
+      <div class="card green">
+        <div class="card-label">Enrolled Site Capacity</div>
+        <div class="card-value">${p.site_kw || 500} kW</div>
+        <div class="card-sub">per commercial BESS site (${p.duration_hours || 2}h duration)</div>
+      </div>
+      <div class="card green">
+        <div class="card-label">Sites at ${optMW} MW</div>
+        <div class="card-value">${Math.ceil(parseFloat(optMW) * 1000 / (p.site_kw || 500))} sites</div>
+        <div class="card-sub">${optMW} MW ÷ ${p.site_kw || 500} kW/site</div>
+      </div>
+      <div class="card green">
+        <div class="card-label">CP Delivery Factor</div>
+        <div class="card-value">${fmtPct(p.delivery_factor)}</div>
+        <div class="card-sub">probability online during CP hour</div>
+      </div>
+      ` : `
       <div class="card green">
         <div class="card-label">Topology Leverage</div>
         <div class="card-value">${p.topology_leverage}x</div>
@@ -724,11 +783,13 @@ export default function GridFlexSim() {
         <div class="card-value">${optMW} MW</div>
         <div class="card-sub">value-maximizing threshold</div>
       </div>
+      `}
     </div>
   </div>
 
+  ${market !== "emc" ? `
   <div class="section">
-    <div class="section-head">Dispatch Protocol — BA Forecast-Based Thermal Pre-cool</div>
+    <div class="section-head">Dispatch Protocol — BA Forecast-Based Flex Load</div>
     <div class="grid3">
       <div class="card amber">
         <div class="card-label">Forecast Peak</div>
@@ -736,23 +797,50 @@ export default function GridFlexSim() {
         <div class="card-sub">BA daily load forecast peak</div>
       </div>
       <div class="card blue">
-        <div class="card-label">Pre-cool Window</div>
+        <div class="card-label">Pre-Dispatch Window</div>
         <div class="card-value">${fmtHour(p.forecast_peak_hour - p.window_hours)} – ${fmtHour(p.forecast_peak_hour)}</div>
-        <div class="card-sub">thermal storage charges; compressor at full load</div>
+        <div class="card-sub">flex load charges / stores energy off-peak</div>
       </div>
       <div class="card green">
         <div class="card-label">Dispatch Window</div>
         <div class="card-value">${fmtHour(p.forecast_peak_hour)} – ${fmtHour(p.forecast_peak_hour + p.window_hours)}</div>
-        <div class="card-sub">near-zero electrical draw; cooling from stored thermal mass</div>
+        <div class="card-sub">load reduces — constraint binding window</div>
       </div>
     </div>
     <div style="font-size:11px; color:#475569; margin-top:10px; line-height:1.7;">
-      Each morning, the operator pulls the BA load forecast, identifies the expected peak hour, and sets the dispatch schedule.
-      Units pre-cool during the charge window — storing thermal energy in the Blue Frontier desiccant system.
-      During the dispatch window, the compressor runs at minimal load while the building is cooled from stored thermal mass, delivering near-zero electrical demand precisely coincident with the constraint binding window.
-      Signal delivery: OpenADR automated dispatch or manual schedule. Peak timing is consistent day-to-day but forecast-confirmed each morning for maximum value capture.
+      Each morning the operator pulls the BA load forecast, identifies the expected peak hour, and confirms the dispatch schedule.
+      Flex load assets stage during the pre-dispatch window and reduce electrical demand during the constraint window.
+      Signal delivery: OpenADR automated dispatch or manual schedule.
     </div>
   </div>
+  ` : `
+  <div class="section">
+    <div class="section-head">Dispatch Protocol — DERMS-Automated CP Event Response</div>
+    <div class="grid3">
+      <div class="card amber">
+        <div class="card-label">CP Event Frequency</div>
+        <div class="card-value">${p.cp_events_per_year} months/yr</div>
+        <div class="card-sub">each month has one CP determinant hour</div>
+      </div>
+      <div class="card blue">
+        <div class="card-label">Dependable CP Reduction</div>
+        <div class="card-value">${(p.mw_flex * (p.delivery_factor || 0.95) * (p.cp_coincidence || 0)).toFixed(1)} MW</div>
+        <div class="card-sub">${optMW} MW × ${fmtPct(p.delivery_factor)} delivery × ${fmtPct(p.cp_coincidence)} CP coincidence</div>
+      </div>
+      <div class="card green">
+        <div class="card-label">Dispatch Method</div>
+        <div class="card-value">Automated</div>
+        <div class="card-sub">DERMS signal via OpenADR — no manual intervention</div>
+      </div>
+    </div>
+    <div style="font-size:11px; color:#475569; margin-top:10px; line-height:1.7;">
+      Enrolled BESS sites are monitored by GridFlex's DERMS platform. When the G&T's CP signal or a forecast-based trigger fires,
+      enrolled sites automatically discharge, reducing coincident demand on the cooperative's billed peak.
+      Measurement & verification is performed against BESS dispatch logs and interval meter data from the cooperative.
+      Once commissioned, BESS sites respond in seconds — delivery factor reflects commissioning and availability, not dispatch lag.
+    </div>
+  </div>
+  `}
 
   <div class="section">
     <div class="section-head">Full Value Stack — At Optimal ${optMW} MW Deployment (${marketLabel})</div>
@@ -807,10 +895,15 @@ export default function GridFlexSim() {
   <div class="section">
     <div class="section-head">Assumptions &amp; Validation Notes</div>
     <div style="font-size:11px; color:#475569; line-height:1.8;">
-      Topology leverage factor (${p.topology_leverage}x) requires validation against network PTDF data for the specific constraint corridor.
+      ${market === "emc"
+        ? `G&T demand charge ($${p.cp_charge_kw_month.toFixed(2)}/kW-mo) and transmission rate ($${p.trans_charge_kw_month.toFixed(2)}/kW-mo) should be confirmed from the G&T's current wholesale rate schedule.
+      CP coincidence factor (${fmtPct(p.cp_coincidence)}) reflects BESS availability during the monthly CP hour — validate post-deployment against interval meter data.
+      Capital deferral assumes ${p.years_deferral}-year load growth trajectory per the cooperative's most recent IRP or capital plan.
+      All values are analytical estimates. Phase 1 involves data sharing and site qualification to firm up inputs.`
+        : `Topology leverage factor (${p.topology_leverage}x) requires validation against network PTDF data for the specific constraint corridor.
       Price differential ($${p.price_diff}/MWh) and binding hours (${p.h_bind} hrs/year) should be confirmed from OASIS data or utility dispatch records.
       Capital deferral timing assumes ${p.years_deferral}-year load growth trajectory per utility IRP.
-      All values presented as analytical estimates pending data confirmation in Phase 1.
+      All values presented as analytical estimates pending data confirmation in Phase 1.`}
     </div>
   </div>
 
@@ -903,7 +996,7 @@ export default function GridFlexSim() {
           <span style={{ fontSize: 10, fontFamily: "monospace", color: marketMeta.accent }}>
             {market === "rto" && "Redispatch + capacity + reserves + energy arbitrage"}
             {market === "vi"  && "Capital deferral + reserves + IRP-driven cost delta"}
-            {market === "emc" && "Coincident-peak avoidance + wholesale arbitrage + capital deferral"}
+            {market === "emc" && "CP avoidance" + (mods.arbitrage ? " + energy arbitrage" : "") + (mods.cap_defer ? " + capital deferral" : "")}
           </span>
         </div>
 
@@ -1006,11 +1099,20 @@ export default function GridFlexSim() {
           {/* NEW — Coincident Peak Avoidance — EMC / muni only */}
           {mods.cp_avoid && (
           <Panel title="Module 2c — Coincident Peak Avoidance" accent="#16a34a" badge={{ text: "EMC HEADLINE", color: "#16a34a" }}>
-            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #16a34a30", paddingLeft: 10 }}>
+            <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 10, borderLeft: "2px solid #16a34a30", paddingLeft: 10 }}>
               Distribution cooperatives are billed by the G&T on a coincident-peak (CP)
               determinant. A 1 MW flex load online during the CP hour reduces the billed
               MW on <em>both</em> the G&T demand charge and the transmission service (NITS)
               charge. This is typically the largest single dollar lever for a coop.
+            </div>
+            <div style={{ background: "#16a34a10", border: "1px solid #16a34a30", borderRadius: 4, padding: "8px 10px", marginBottom: 12, fontSize: 10, fontFamily: "monospace", color: "#4a7090", lineHeight: 1.7 }}>
+              <div style={{ color: "#16a34a", fontWeight: 700, marginBottom: 3, fontSize: 9, letterSpacing: "0.1em" }}>RATE LOOKUP — WHERE TO FIND THESE NUMBERS</div>
+              <div>Pull from your G&T's <strong>wholesale rate schedule</strong> (typically on their website or member portal).</div>
+              <div style={{ marginTop: 3 }}>SE reference ranges — <em>confirm from actual tariff:</em></div>
+              <div style={{ marginTop: 2, paddingLeft: 8 }}>
+                <div>• OPC-served Georgia EMCs: G&T demand ~$5–6/kW-mo, GTC NITS ~$2–4/kW-mo</div>
+                <div>• Other SE G&Ts: total CP rate typically $6–12/kW-mo = $72–144/kW-yr</div>
+              </div>
             </div>
             <Slider label="G&T Demand Charge ($/kW-month on CP)" value={p.cp_charge_kw_month}
               display={"$" + p.cp_charge_kw_month.toFixed(2) + "/kW-mo"}
@@ -1031,9 +1133,10 @@ export default function GridFlexSim() {
           </Panel>
           )}
 
-          {/* NEW — Energy Arbitrage — RTO + EMC */}
-          {mods.arbitrage && (
-          <Panel title="Module 2d — Energy Arbitrage" accent="#0ea5e9">
+          {/* NEW — Energy Arbitrage — RTO + EMC — toggleable */}
+          {(baseMods.arbitrage) && (
+          <Panel title="Module 2d — Energy Arbitrage" accent="#0ea5e9"
+            toggleable enabled={mods.arbitrage} onToggle={() => toggleModule("arbitrage")}>
             <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #0ea5e930", paddingLeft: 10 }}>
               Pre-cool during off-peak hours (cheap $/MWh) and dispatch during peak
               hours (expensive $/MWh). Independent of whether a constraint is binding —
@@ -1074,7 +1177,8 @@ export default function GridFlexSim() {
             )}
           </Panel>
 
-          {/* Module 5 — Dispatch Timing */}
+          {/* Module 5 — Dispatch Timing — RTO/VI only (BESS dispatches automatically, no pre-cool needed) */}
+          {market !== "emc" && (
           <Panel title="Module 5 — Dispatch Timing" accent="#f59e0b" badge={{ text: "BA FORECAST INPUT", color: "#f59e0b" }}>
             <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #f59e0b30", paddingLeft: 10 }}>
               Pull the BA daily load forecast. Enter the expected peak hour and how many hours on each side.
@@ -1164,10 +1268,12 @@ export default function GridFlexSim() {
               })()}
             </div>
           </Panel>
+          )}
 
-          {/* Module 6 — Capital Deferral */}
-          {mods.cap_defer && (
-          <Panel title="Module 6 — Capital Deferral" accent="#f59e0b" badge={{ text: "STRUCTURAL OVERLAY", color: "#f59e0b" }}>
+          {/* Module 6 — Capital Deferral — toggleable */}
+          {(baseMods.cap_defer) && (
+          <Panel title="Module 6 — Capital Deferral" accent="#f59e0b" badge={{ text: "STRUCTURAL OVERLAY", color: "#f59e0b" }}
+            toggleable enabled={mods.cap_defer} onToggle={() => toggleModule("cap_defer")}>
             <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #f59e0b30", paddingLeft: 10 }}>
               One-time NPV from pushing out a planned capital project. Per the
               Pilot-Grade Process — kept as a separate overlay, not mixed into
@@ -1176,16 +1282,17 @@ export default function GridFlexSim() {
               reduction (EMC).
             </div>
             <Slider label="Infrastructure Project Cost" value={p.capex / 1e6} display={"$" + (p.capex / 1e6).toFixed(0) + "M"}
-              onChange={(v) => set("capex")(v * 1e6)} min={1} max={200} step={1} note="Substation / feeder / interface upgrade cost" />
+              onChange={(v) => set("capex")(v * 1e6)} min={1} max={100} step={1} note="Substation / feeder / interface upgrade cost" />
             <Slider label="WACC" value={p.wacc} display={fmtPct(p.wacc)}
-              onChange={set("wacc")} min={0.03} max={0.12} step={0.005} note="Utility weighted average cost of capital" />
+              onChange={set("wacc")} min={0.03} max={0.12} step={0.005}
+              note={market === "emc" ? "EMC cost of capital — cooperatives typically 4–7%" : "Utility weighted average cost of capital"} />
             <Slider label="Deferral Years" value={p.years_deferral} display={p.years_deferral + " yrs"}
-              onChange={set("years_deferral")} min={1} max={10} step={1} note="Years the upgrade can be delayed" />
+              onChange={set("years_deferral")} min={1} max={10} step={1} note="Years the upgrade can be delayed by meeting the load reduction threshold" />
             <Slider label="MW Threshold for Full Deferral" value={p.mw_deferral_threshold} display={p.mw_deferral_threshold + " MW"}
-              onChange={set("mw_deferral_threshold")} min={1} max={500} step={5}
+              onChange={set("mw_deferral_threshold")} min={1} max={100} step={1}
               note={mods.redispatch
                 ? "MW of constraint relief required to push out the project"
-                : "MW of CP-coincident load reduction required to push out the project"} />
+                : "MW of CP-coincident peak reduction needed to defer the upgrade — confirm from IRP load forecast"} />
             <div style={{ background: "#f59e0b10", border: "1px solid #f59e0b30", borderRadius: 5, padding: "8px 10px", marginTop: 6, fontSize: 11, fontFamily: "monospace", color: "#f59e0b" }}>
               Full deferral NPV: {fmtD(r.capital_deferral_full)} ×{" "}
               <span style={{ color: r.deferral_realized >= 0.95 ? "#22c55e" : r.deferral_realized >= 0.5 ? "#f59e0b" : "#ef4444", fontWeight: 700 }}>
@@ -1195,18 +1302,86 @@ export default function GridFlexSim() {
           </Panel>
           )}
 
-          {/* Module 7 — Building Incentive */}
-          <Panel title="Module 7 — Flex Load Incentive" accent="#f472b6">
-            <Slider label="Flex Load Unit Cost (installed)" value={p.hvac_unit_cost} display={"$" + (p.hvac_unit_cost / 1000).toFixed(0) + "K"}
-              onChange={set("hvac_unit_cost")} min={15000} max={120000} step={1000} note="Fully installed cost per flex load unit" />
-            <Slider label="Unit Electrical Capacity" value={p.hvac_unit_kw} display={p.hvac_unit_kw + " kW"}
-              onChange={set("hvac_unit_kw")} min={5} max={60} step={1} note="kW electrical demand per unit" />
-            <Slider label="ITC Tax Credit" value={p.itc_pct} display={fmtPct(p.itc_pct)}
-              onChange={set("itc_pct")} min={0.1} max={0.5} step={0.05} note="48E Clean Electricity ITC — 30-40% typical" />
-            <Slider label="Utility Rebate" value={p.utility_incentive_pct} display={fmtPct(p.utility_incentive_pct)}
-              onChange={set("utility_incentive_pct")} min={0} max={0.5} step={0.05} note="Rebate as % of unit cost — funded from avoided cost pool" />
-            <Slider label="Diminishing Returns Threshold" value={p.threshold_pct} display={p.threshold_pct + "% of peak"}
-              onChange={set("threshold_pct")} min={5} max={50} step={5} note="Optimal MW = where marginal value drops below this % of peak" />
+          {/* Module 7 — Site Sizing & Incentive */}
+          <Panel title={market === "emc" ? "Module 7 — BESS Site Sizing & Incentive" : "Module 7 — Flex Load Incentive"} accent="#f472b6">
+            {market === "emc" ? (
+              <>
+                <div style={{ fontSize: 11, color: "#4a7090", fontFamily: "monospace", lineHeight: 1.7, marginBottom: 12, borderLeft: "2px solid #f472b430", paddingLeft: 10 }}>
+                  Cost = (site kW × duration × $/kWh) + per-site soft costs. Sites needed = ⌈MW × 1000 / site kW⌉.
+                </div>
+                <Slider label="Enrolled Site Capacity" value={p.site_kw || 500}
+                  display={(p.site_kw || 500) + " kW per site"}
+                  onChange={set("site_kw")} min={250} max={1000} step={50}
+                  note={"Sites at " + p.mw_flex + " MW: " + Math.ceil(p.mw_flex * 1000 / (p.site_kw || 500)) + " sites (range 250–1,000 kW C&I BESS)"} />
+                {/* Duration toggle */}
+                <div style={{ marginBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 5 }}>
+                    <span style={{ fontSize: 11, color: "#7a90a8", fontFamily: "monospace" }}>Storage Duration</span>
+                    <span style={{ fontSize: 12, color: "#e2e8f0", fontFamily: "monospace", fontWeight: 700 }}>{(p.duration_hours || 2)}h — {(p.site_kw || 500) * (p.duration_hours || 2)} kWh/site</span>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {[2, 4].map((h) => (
+                      <button key={h} onClick={() => set("duration_hours")(h)} style={{
+                        flex: 1, fontSize: 11, fontFamily: "monospace", fontWeight: 700,
+                        background: (p.duration_hours || 2) === h ? "#f472b4" : "#0b1520",
+                        color: (p.duration_hours || 2) === h ? "#fff" : "#4a6080",
+                        border: "1px solid " + ((p.duration_hours || 2) === h ? "#f472b4" : "#1e3a5a"),
+                        borderRadius: 4, padding: "6px 0", cursor: "pointer",
+                      }}>{h}h Duration</button>
+                    ))}
+                  </div>
+                  <div style={{ fontSize: 10, color: "#3d5068", fontFamily: "monospace", marginTop: 3 }}>
+                    2h = peak shave + CP avoidance | 4h = extended dispatch + deeper CP confidence
+                  </div>
+                </div>
+                <Slider label="BESS Hardware Cost" value={p.bess_cost_kwh || 350}
+                  display={"$" + (p.bess_cost_kwh || 350) + "/kWh"}
+                  onChange={set("bess_cost_kwh")} min={150} max={500} step={10}
+                  note={"Site hardware: $" + (((p.site_kw || 500) * (p.duration_hours || 2) * (p.bess_cost_kwh || 350)) / 1000).toFixed(0) + "K — all-in installed (inverter, BMS, installation)"} />
+                <Slider label="Per-Site Soft Costs" value={(p.site_soft_cost || 50000) / 1000}
+                  display={"$" + ((p.site_soft_cost || 50000) / 1000).toFixed(0) + "K/site"}
+                  onChange={(v) => set("site_soft_cost")(v * 1000)} min={20} max={80} step={5}
+                  note="Permitting, engineering, commissioning, interconnection — flat per site" />
+                <Slider label="ITC Tax Credit" value={p.itc_pct || 0.30} display={fmtPct(p.itc_pct || 0.30)}
+                  onChange={set("itc_pct")} min={0.1} max={0.5} step={0.05} note="48E Clean Electricity ITC — 30% base, up to 50% with adders" />
+                <Slider label="Diminishing Returns Threshold" value={p.threshold_pct} display={p.threshold_pct + "% of peak"}
+                  onChange={set("threshold_pct")} min={5} max={50} step={5} note="For EMC (linear-value market), this anchors to your input MW — no saturation gate" />
+                {(() => {
+                  const siteKw = p.site_kw || 500;
+                  const siteKwh = siteKw * (p.duration_hours || 2);
+                  const siteCost = siteKwh * (p.bess_cost_kwh || 350) + (p.site_soft_cost || 50000);
+                  const sites = Math.ceil(p.mw_flex * 1000 / siteKw);
+                  const gross = sites * siteCost;
+                  const itc = gross * (p.itc_pct || 0.30);
+                  const net = gross - itc;
+                  return (
+                    <div style={{ background: "#f472b410", border: "1px solid #f472b430", borderRadius: 5, padding: "9px 11px", marginTop: 6, fontSize: 11, fontFamily: "monospace" }}>
+                      <div style={{ color: "#f472b6", marginBottom: 5, fontSize: 10, letterSpacing: "0.08em" }}>CAPITAL SUMMARY — {p.mw_flex} MW ({sites} SITES × {siteKw} kW)</div>
+                      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, color: "#4a7090" }}>
+                        <div>Site kWh: <span style={{ color: "#e2e8f0" }}>{siteKwh} kWh</span></div>
+                        <div>Site cost: <span style={{ color: "#e2e8f0" }}>{fmtD(siteCost)}</span></div>
+                        <div>Gross capital: <span style={{ color: "#ef4444" }}>{fmtD(gross)}</span></div>
+                        <div>ITC ({fmtPct(p.itc_pct || 0.30)}): <span style={{ color: "#22c55e" }}>–{fmtD(itc)}</span></div>
+                      </div>
+                      <div style={{ marginTop: 5, color: "#f59e0b", fontWeight: 700 }}>Net owner cost: {fmtD(net)}</div>
+                    </div>
+                  );
+                })()}
+              </>
+            ) : (
+              <>
+                <Slider label="Flex Load Unit Cost (installed)" value={p.hvac_unit_cost} display={"$" + (p.hvac_unit_cost / 1000).toFixed(0) + "K"}
+                  onChange={set("hvac_unit_cost")} min={15000} max={120000} step={1000} note="Fully installed cost per flex load unit" />
+                <Slider label="Unit Electrical Capacity" value={p.hvac_unit_kw} display={p.hvac_unit_kw + " kW"}
+                  onChange={set("hvac_unit_kw")} min={5} max={60} step={1} note="kW electrical demand per unit" />
+                <Slider label="ITC Tax Credit" value={p.itc_pct} display={fmtPct(p.itc_pct)}
+                  onChange={set("itc_pct")} min={0.1} max={0.5} step={0.05} note="48E Clean Electricity ITC — 30-40% typical" />
+                <Slider label="Utility Rebate" value={p.utility_incentive_pct} display={fmtPct(p.utility_incentive_pct)}
+                  onChange={set("utility_incentive_pct")} min={0} max={0.5} step={0.05} note="Rebate as % of unit cost — funded from avoided cost pool" />
+                <Slider label="Diminishing Returns Threshold" value={p.threshold_pct} display={p.threshold_pct + "% of peak"}
+                  onChange={set("threshold_pct")} min={5} max={50} step={5} note="Optimal MW = where marginal value drops below this % of peak" />
+              </>
+            )}
           </Panel>
 
           {/* Module 8 — Contract Structure */}
@@ -1261,8 +1436,9 @@ export default function GridFlexSim() {
                 color="#22c55e" tag="ANNUAL BENEFIT (VI)" />
             )}
             {market === "emc" && (
-              <MBox label="CP Avoidance + Arbitrage" value={fmtD(r.cp_avoidance_value + r.arbitrage_value)}
-                sub={"CP: " + fmtD(r.cp_avoidance_value) + " | Arb: " + fmtD(r.arbitrage_value)}
+              <MBox label={mods.arbitrage ? "CP Avoidance + Arbitrage" : "CP Avoidance"}
+                value={fmtD(r.cp_avoidance_value + r.arbitrage_value)}
+                sub={"CP: " + fmtD(r.cp_avoidance_value) + (mods.arbitrage ? " | Arb: " + fmtD(r.arbitrage_value) : "")}
                 color="#16a34a" tag="ANNUAL BENEFIT (EMC)" />
             )}
             <MBox label="Total Value Stack" value={fmtD(r.total_value)}
@@ -1632,12 +1808,16 @@ export default function GridFlexSim() {
               <Panel title={"Incentive Model — At Optimal " + optimal.mw + " MW Deployment"} accent="#f472b6">
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 10, marginBottom: 14 }}>
                   {[
-                    { label: "Units Required",                value: optIncentive.units + " units",  sub: "at " + p.hvac_unit_kw + " kW/unit",         color: "#e2e8f0" },
+                    market === "emc"
+                      ? { label: "Enrolled Sites",   value: optIncentive.units + " sites", sub: "at " + (p.site_kw || 500) + " kW/site × " + (p.duration_hours || 2) + "h", color: "#e2e8f0" }
+                      : { label: "Units Required",   value: optIncentive.units + " units", sub: "at " + p.hvac_unit_kw + " kW/unit", color: "#e2e8f0" },
                     { label: "Gross Install Cost",            value: fmtD(optIncentive.gross),       sub: "before incentives",                           color: "#ef4444" },
-                    { label: "ITC Credit (" + fmtPct(p.itc_pct) + ")", value: fmtD(optIncentive.itc), sub: "owner receives directly",                  color: "#22c55e" },
-                    { label: "Utility Rebate (" + fmtPct(p.utility_incentive_pct) + ")", value: fmtD(optIncentive.rebate), sub: "funded from avoided cost pool", color: "#3b82f6" },
-                    { label: "Net Cost to Owner",             value: fmtD(optIncentive.net),         sub: "after all incentives",                        color: "#f59e0b" },
-                    { label: "Utility Value Pool (8yr)",      value: fmtD(optIncentive.pool),        sub: "production delta × 8yr — self-funding basis", color: "#8b5cf6" },
+                    { label: "ITC Credit (" + fmtPct(p.itc_pct) + ")", value: fmtD(optIncentive.itc), sub: "48E Clean Electricity ITC — owner receives directly", color: "#22c55e" },
+                    market === "emc"
+                      ? { label: "No Utility Rebate", value: "—", sub: "utility rebate N/A for BESS sites", color: "#3d5068" }
+                      : { label: "Utility Rebate (" + fmtPct(p.utility_incentive_pct) + ")", value: fmtD(optIncentive.rebate), sub: "funded from avoided cost pool", color: "#3b82f6" },
+                    { label: "Net Cost to Owner",             value: fmtD(optIncentive.net),         sub: "after ITC",                                   color: "#f59e0b" },
+                    { label: "Value Pool (" + p.contract_years + "yr)", value: fmtD(optIncentive.pool), sub: "addressable revenue × contract term",      color: "#8b5cf6" },
                   ].map((item, i) => (
                     <div key={i} style={{ background: "#070d14", border: "1px solid " + item.color + "25", borderLeft: "2px solid " + item.color, borderRadius: 5, padding: "10px 12px" }}>
                       <div style={{ fontSize: 9, color: "#2d4a63", fontFamily: "monospace", marginBottom: 2 }}>{item.label}</div>
@@ -1666,7 +1846,24 @@ export default function GridFlexSim() {
               </Panel>
 
               <Panel title="Self-Financing Incentive Logic" accent="#22c55e">
-                {[
+                {(market === "emc" ? [
+                  [
+                    "Step 1 — CP avoidance creates the value pool",
+                    "At " + optimal.mw + " MW deployed (" + optIncentive.units + " sites), the fleet delivers " + fmtD(r.cp_avoidance_value) + "/yr in G&T demand charge avoidance. That avoided cost — paid by the cooperative to the G&T — is the funding source for the program."
+                  ],
+                  [
+                    "Step 2 — ITC covers " + fmtPct(p.itc_pct || 0.30) + " of site cost upfront",
+                    "48E Clean Electricity ITC applies to BESS equipment and installation. Site owner receives this as a tax credit reducing net capital cost from " + fmtD(optIncentive.gross) + " to " + fmtD(optIncentive.net) + "."
+                  ],
+                  [
+                    "Step 3 — GridFlex earns " + fmtPct(p.gridflex_rate_pct) + " of the cooperative's avoided cost",
+                    "The NWA contract is structured so GridFlex is paid from the G&T savings the cooperative actually realizes. The cooperative retains " + fmtPct(1 - p.gridflex_rate_pct) + " of avoided cost as net savings. GridFlex passes a facility incentive to enrolled sites as bill credits."
+                  ],
+                  [
+                    "Step 4 — The alignment",
+                    "The cooperative reduces G&T costs, defers distribution upgrades, and has a single vendor. Building owners get BESS assets at reduced net cost plus ongoing bill credits. GridFlex earns from structuring and verifying the engagement. The G&T savings create the value — no party subsidizes another."
+                  ],
+                ] : [
                   [
                     "Step 1 — Topology targeting creates the value pool",
                     "By deploying at the optimal node (" + p.topology_leverage + "x leverage), " + optimal.mw + " MW of flex load relieves " + Math.min(r.mw_redisp_equivalent, p.mw_redisp).toFixed(0) + " MW of redispatch. Annual production cost delta = " + fmtD(optimal.production_cost_delta) + ". That's the utility's savings — and the funding source for incentives."
@@ -1677,7 +1874,7 @@ export default function GridFlexSim() {
                   ],
                   [
                     "Step 3 — Utility rebate is self-funded by avoided cost",
-                    "The " + fmtPct(p.utility_incentive_pct) + " utility rebate (" + fmtD(optIncentive.rebate) + ") is funded directly from the production cost savings. Over 8 years the utility value pool is " + fmtD(optIncentive.pool) + " — the rebate is a fraction of avoided cost returned to building owners."
+                    "The " + fmtPct(p.utility_incentive_pct) + " utility rebate (" + fmtD(optIncentive.rebate) + ") is funded directly from the production cost savings. Over " + p.contract_years + " years the utility value pool is " + fmtD(optIncentive.pool) + " — the rebate is a fraction of avoided cost returned to building owners."
                   ],
                   [
                     "Step 4 — Net owner cost after incentives",
@@ -1687,7 +1884,7 @@ export default function GridFlexSim() {
                     "Step 5 — The alignment",
                     "The utility saves on production cost, defers capital, and funds the rebate from avoided cost. The load owner gets upgraded flex load assets at reduced net cost. GridFlex earns from structuring and validating the engagement. No party subsidizes another — the constraint relief creates the value."
                   ],
-                ].map(([title, body], i) => (
+                ]).map(([title, body], i) => (
                   <div key={i} style={{ borderBottom: "1px solid #0f1c2a", paddingBottom: 10, marginBottom: 10 }}>
                     <div style={{ fontSize: 11, color: "#e2e8f0", fontFamily: "monospace", marginBottom: 3 }}>{title}</div>
                     <div style={{ fontSize: 10, color: "#3d5068", lineHeight: 1.7 }}>{body}</div>
