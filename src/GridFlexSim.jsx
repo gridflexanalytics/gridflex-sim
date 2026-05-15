@@ -931,7 +931,44 @@ export default function GridFlexSim() {
   </div>
 
   <div class="section">
-    <div class="section-head">Contract Structure — ${p.contract_years}-Year NWA Agreement</div>
+    <div class="section-head">Contract Structure — ${p.contract_years}-Year Agreement</div>
+    ${market === "emc" ? `
+    <div class="grid3" style="margin-bottom:12px;">
+      <div class="card green">
+        <div class="card-label">G&T Avoided Cost</div>
+        <div class="card-value" style="font-size:16px;">$${contract ? Math.round(contract.avoided_kw_yr) : "—"}/kW-yr</div>
+        <div class="card-sub">CP demand reduction at ${optMW} MW deployed</div>
+      </div>
+      <div class="card blue">
+        <div class="card-label">NWA Contract Rate</div>
+        <div class="card-value" style="font-size:16px;">$${contract ? Math.round(contract.gridflex_rate_kw_yr) : "—"}/kW-yr</div>
+        <div class="card-sub">cooperative pays GridFlex — single invoice</div>
+      </div>
+      <div class="card purple">
+        <div class="card-label">Cooperative Net Savings</div>
+        <div class="card-value" style="font-size:16px;">$${contract ? Math.round(contract.utility_net_kw_yr) : "—"}/kW-yr</div>
+        <div class="card-sub">retained vs. G&T infrastructure build</div>
+      </div>
+    </div>
+    <table>
+      <tr><th>How It Works</th><th style="text-align:right;"></th></tr>
+      <tr><td class="td-label">Cooperative → GridFlex</td><td class="td-value">NWA contract payment — funded by avoided G&T demand charges</td></tr>
+      <tr><td class="td-label">Enrolled Facilities</td><td class="td-value">Zero upfront cost — BESS installed and operated by GridFlex; facilities share in on-site demand savings</td></tr>
+      <tr><td class="td-label">GridFlex Role</td><td class="td-value">Owns, operates, and dispatches the BESS fleet; handles all M&V, DERMS, and contract administration</td></tr>
+    </table>
+    <table style="margin-top:10px;">
+      <tr><th>Cooperative Economics</th><th style="text-align:right;">Annual</th><th style="text-align:right;">${p.contract_years}-Year Total</th></tr>
+      <tr><td class="td-label">G&T demand charge reduction</td><td class="td-value" style="color:#16a34a;">${contract ? fmtD(contract.avoided_kw_yr * optMW_kw) : "—"}</td><td class="td-value" style="color:#16a34a;">${contract ? fmtD(contract.avoided_kw_yr * optMW_kw * p.contract_years) : "—"}</td></tr>
+      <tr><td class="td-label">NWA payment to GridFlex</td><td class="td-value" style="color:#dc2626;">–${contract ? fmtD(contract.nwa_annual) : "—"}</td><td class="td-value" style="color:#dc2626;">–${contract ? fmtD(contract.nwa_annual * p.contract_years) : "—"}</td></tr>
+      <tr style="background:#f0fdf4;"><td class="td-label" style="font-weight:600;">Cooperative Net Savings</td><td class="td-value" style="color:#16a34a;">${contract ? fmtD(contract.utility_net_annual) : "—"}</td><td class="td-value" style="color:#16a34a;">${contract ? fmtD(contract.utility_net_annual * p.contract_years) : "—"}</td></tr>
+    </table>
+    <div style="font-size:11px; color:#64748b; margin-top:10px; line-height:1.6;">
+      The cooperative executes a single NWA contract with GridFlex — no capital outlay, no facility coordination required.
+      GridFlex owns and operates the enrolled BESS fleet, dispatches automatically on CP signals via OpenADR, and provides monthly M&V reporting.
+      Enrolled commercial facilities host BESS at no upfront cost and benefit from reduced on-site demand charges.
+      Cooperative net savings over ${p.contract_years} years vs. building the deferred infrastructure: <strong>${contract ? fmtD(contract.utility_net_annual * p.contract_years) : "—"}</strong>.
+    </div>
+    ` : `
     <div class="grid3" style="margin-bottom:12px;">
       <div class="card green">
         <div class="card-label">Utility Avoided Cost</div>
@@ -960,6 +997,7 @@ export default function GridFlexSim() {
       Facility incentives are administered downstream by GridFlex as monthly bill credits, offsetting each facility's flex load service cost.
       The utility's ${p.contract_years}-year net savings vs. building the deferred infrastructure: <strong>${contract ? fmtD(contract.utility_net_annual * p.contract_years) : "—"}</strong>.
     </div>
+    `}
   </div>
 
   <div class="section">
@@ -1963,12 +2001,12 @@ export default function GridFlexSim() {
                     "48E Clean Electricity ITC applies to BESS equipment and installation. Site owner receives this as a tax credit reducing net capital cost from " + fmtD(optIncentive.gross) + " to " + fmtD(optIncentive.net) + "."
                   ],
                   [
-                    "Step 3 — GridFlex earns " + fmtPct(p.gridflex_rate_pct) + " of the cooperative's avoided cost",
-                    "The NWA contract is structured so GridFlex is paid from the G&T savings the cooperative actually realizes. The cooperative retains " + fmtPct(1 - p.gridflex_rate_pct) + " of avoided cost as net savings. GridFlex passes a facility incentive to enrolled sites as bill credits."
+                    "Step 3 — Dual-revenue contract funds GridFlex operations",
+                    "GridFlex receives an NWA payment from the cooperative (funded by G&T savings) plus a share of on-site demand charge savings at each enrolled facility. Enrolled facilities contribute zero upfront capital — GridFlex owns and finances the BESS fleet."
                   ],
                   [
                     "Step 4 — The alignment",
-                    "The cooperative reduces G&T costs, defers distribution upgrades, and has a single vendor. Building owners get BESS assets at reduced net cost plus ongoing bill credits. GridFlex earns from structuring and verifying the engagement. The G&T savings create the value — no party subsidizes another."
+                    "The cooperative reduces G&T costs, defers distribution upgrades, and has a single vendor. Enrolled facilities host BESS at no upfront cost and see reduced on-site demand charges. GridFlex earns from owning, operating, and verifying the fleet. The G&T savings and on-site demand reduction create the value — no party subsidizes another."
                   ],
                 ] : [
                   [
