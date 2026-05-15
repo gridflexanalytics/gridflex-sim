@@ -212,12 +212,12 @@ function runModel(p) {
         * 12
     : 0;
 
-  // ── Energy arbitrage — pre-cool off-peak, dispatch peak. arb_hours_per_year
-  // is already a curated subset of profitable hours, so don't double-derate
-  // by constraint coincidence_factor (that's a binding-hour overlap, not an
-  // arb-hour overlap). Apply delivery factor only.
+  // ── Energy arbitrage — for BESS (EMC), a 4h system shifts 2× the MWh per
+  // dispatch cycle vs. a 2h system. Scale by duration_hours/2 so duration
+  // choice shows up in value, not just cost. RTO/VI (non-BESS) = no scaling.
+  const arb_duration_scale = (p.market === "emc") ? ((p.duration_hours || 2) / 2) : 1;
   const arbitrage_value = mods.arbitrage
-    ? p.mw_flex * (p.delivery_factor || 1) * (p.arb_spread_mwh || 0) * (p.arb_hours_per_year || 0)
+    ? p.mw_flex * (p.delivery_factor || 1) * (p.arb_spread_mwh || 0) * (p.arb_hours_per_year || 0) * arb_duration_scale
     : 0;
 
   // ── Capital deferral — structural overlay, scaled by deployment realization.
@@ -1638,8 +1638,12 @@ export default function GridFlexSim() {
 
                 {/* Energy arbitrage — RTO + EMC */}
                 {mods.arbitrage && (
-                  <FRow num="A1" formula="Arbitrage_value = MW × Delivery × $/MWh_spread × Hours/yr"
-                    inputs={p.mw_flex + " × " + fmtPct(p.delivery_factor) + " × $" + p.arb_spread_mwh + "/MWh × " + p.arb_hours_per_year + " hrs"}
+                  <FRow num="A1"
+                    formula={market === "emc"
+                      ? "Arbitrage_value = MW × Delivery × $/MWh × Hours/yr × (Duration/2h)"
+                      : "Arbitrage_value = MW × Delivery × $/MWh_spread × Hours/yr"}
+                    inputs={p.mw_flex + " × " + fmtPct(p.delivery_factor) + " × $" + p.arb_spread_mwh + "/MWh × " + p.arb_hours_per_year + " hrs"
+                      + (market === "emc" ? " × " + (p.duration_hours || 2) + "h÷2" : "")}
                     result={fmtD(r.arbitrage_value)} color="#0ea5e9" />
                 )}
 
